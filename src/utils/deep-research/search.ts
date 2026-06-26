@@ -321,14 +321,14 @@ Respond in the same language as the query.`,
       }
     );
     const data = await response.json();
-    const content = data.choices?.[0]?.message?.content || "";
+    const content = String(data.choices?.[0]?.message?.content ?? "");
     // Parse sources from the response content by extracting URLs
     const urlRegex = /https?:\/\/[^\s\)\]}」』」」」」」」]+/g;
-    const urls = content.match(urlRegex) || [];
-    const uniqueUrls = [...new Set(urls)];
+    const urls: string[] = content.match(urlRegex) ?? [];
+    const uniqueUrls = [...new Set<string>(urls)];
 
     return {
-      sources: uniqueUrls.map((url: string) => ({
+      sources: uniqueUrls.map((url) => ({
         content,
         url,
         title: "",
