@@ -39,6 +39,8 @@ const BOCHA_API_BASE_URL =
   process.env.BOCHA_API_BASE_URL || "https://api.bochaai.com";
 const SEARXNG_API_BASE_URL =
   process.env.SEARXNG_API_BASE_URL || "http://0.0.0.0:8080";
+const GROK_SEARCH_API_BASE_URL =
+  process.env.GROK_SEARCH_API_BASE_URL || "";
 
 export default async function Config(phase: string) {
   const nextConfig: NextConfig = {
@@ -142,6 +144,10 @@ export default async function Config(phase: string) {
         {
           source: "/api/search/searxng/:path*",
           destination: `${SEARXNG_API_BASE_URL}/:path*`,
+        },
+        {
+          source: "/api/search/grok/:path*",
+          destination: `${GROK_SEARCH_API_BASE_URL || API_PROXY_BASE_URL}/:path*`,
         },
       ];
     };

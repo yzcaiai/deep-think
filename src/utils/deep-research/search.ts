@@ -4,6 +4,7 @@ import {
   EXA_BASE_URL,
   BOCHA_BASE_URL,
   SEARXNG_BASE_URL,
+  GROK_BASE_URL,
 } from "@/constants/urls";
 import { rewritingPrompt } from "@/constants/prompts";
 import { completePath } from "@/utils/url";
@@ -123,6 +124,7 @@ export interface SearchProviderOptions {
   query: string;
   maxResult?: number;
   scope?: string;
+  model?: string;
 }
 
 export async function createSearchProvider({
@@ -132,6 +134,7 @@ export async function createSearchProvider({
   query,
   maxResult = 5,
   scope,
+  model: modelParam,
 }: SearchProviderOptions) {
   const headers: HeadersInit = {
     "Content-Type": "application/json",
@@ -281,6 +284,56 @@ export async function createSearchProvider({
           description: item.name || matchingResult?.name,
         };
       }) as ImageSource[],
+    };
+  } else if (provider === "grok") {
+    const model = modelParam || "grok-4.20-fast";
+    const response = await fetch(
+      `${completePath(baseURL || GROK_BASE_URL)}/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          ...headers,
+          // Bypass CDN/edge cache
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          Pragma: "no-cache",
+        },
+        credentials: "omit",
+        body: JSON.stringify({
+          model,
+          messages: [
+            {
+              role: "system",
+              content: `You are a web research assistant. Search the web for the given query and return structured results.
+For each source found, include the title, URL, and a comprehensive content summary.
+Always end with a "Sources" section listing all URLs used.
+Respond in the same language as the query.`,
+            },
+            {
+              role: "user",
+              content: `Search for: ${query}\n\nProvide detailed information from search results. Include relevant facts, data, and cite your sources with URLs.`,
+            },
+          ],
+          // Add random seed + timestamp to avoid cached/stale responses
+          seed: Math.floor(Math.random() * 2147483647),
+          user: `cache-buster-${Date.now()}`,
+          stream: false,
+        }),
+      }
+    );
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content || "";
+    // Parse sources from the response content by extracting URLs
+    const urlRegex = /https?:\/\/[^\s\)\]}」』」」」」」」]+/g;
+    const urls = content.match(urlRegex) || [];
+    const uniqueUrls = [...new Set(urls)];
+
+    return {
+      sources: uniqueUrls.map((url: string) => ({
+        content,
+        url,
+        title: "",
+      })) as Source[],
+      images: [],
     };
   } else if (provider === "searxng") {
     const params = {

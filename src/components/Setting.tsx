@@ -66,6 +66,7 @@ import {
   EXA_BASE_URL,
   BOCHA_BASE_URL,
   SEARXNG_BASE_URL,
+  GROK_BASE_URL,
 } from "@/constants/urls";
 import locales from "@/constants/locales";
 import {
@@ -159,6 +160,9 @@ const formSchema = z.object({
   bochaApiProxy: z.string().optional(),
   searxngApiProxy: z.string().optional(),
   searxngScope: z.string().optional(),
+  grokSearchApiKey: z.string().optional(),
+  grokSearchApiProxy: z.string().optional(),
+  grokSearchModel: z.string().optional(),
   parallelSearch: z.number().min(1).max(5),
   searchMaxResult: z.number().min(1).max(10),
   language: z.string().optional(),
@@ -2422,6 +2426,9 @@ function Setting({ open, onClose }: SettingProps) {
                             {!isDisabledSearchProvider("searxng") ? (
                               <SelectItem value="searxng">SearXNG</SelectItem>
                             ) : null}
+                            {!isDisabledSearchProvider("grok") ? (
+                              <SelectItem value="grok">Grok AI Search</SelectItem>
+                            ) : null}
                           </SelectContent>
                         </Select>
                       </FormControl>
@@ -2737,6 +2744,68 @@ function Setting({ open, onClose }: SettingProps) {
                                 </SelectItem>
                               </SelectContent>
                             </Select>
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+                  <div
+                    className={cn("space-y-4", {
+                      hidden: searchProvider !== "grok",
+                    })}
+                  >
+                    <FormField
+                      control={form.control}
+                      name="grokSearchApiKey"
+                      render={({ field }) => (
+                        <FormItem className="from-item">
+                          <FormLabel className="from-label">
+                            API Key
+                            <span className="ml-1 text-red-500 max-sm:hidden">*</span>
+                          </FormLabel>
+                          <FormControl className="form-field">
+                            <Password
+                              type="text"
+                              placeholder="sk-..."
+                              disabled={form.getValues("enableSearch") === "0"}
+                              {...field}
+                            />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name="grokSearchApiProxy"
+                      render={({ field }) => (
+                        <FormItem className="from-item">
+                          <FormLabel className="from-label">
+                            API URL
+                          </FormLabel>
+                          <FormControl className="form-field">
+                            <Input
+                              placeholder={GROK_BASE_URL}
+                              disabled={form.getValues("enableSearch") === "0"}
+                              {...field}
+                            />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name="grokSearchModel"
+                      render={({ field }) => (
+                        <FormItem className="from-item">
+                          <FormLabel className="from-label">
+                            模型
+                          </FormLabel>
+                          <FormControl className="form-field">
+                            <Input
+                              placeholder="grok-4.20-fast"
+                              disabled={form.getValues("enableSearch") === "0"}
+                              {...field}
+                            />
                           </FormControl>
                         </FormItem>
                       )}

@@ -28,6 +28,18 @@ function useWebSearch() {
         }
         options.scope = tavilyScope;
         break;
+      case "grok":
+        const { grokSearchApiKey, grokSearchApiProxy, grokSearchModel } =
+          useSettingStore.getState();
+        if (mode === "local") {
+          options.baseURL = grokSearchApiProxy;
+          options.apiKey = multiApiKeyPolling(grokSearchApiKey);
+        } else {
+          options.baseURL = location.origin + "/api/search/grok";
+        }
+        options.scope = grokSearchModel;
+        options.model = grokSearchModel;
+        break;
       case "firecrawl":
         const { firecrawlApiKey, firecrawlApiProxy } =
           useSettingStore.getState();

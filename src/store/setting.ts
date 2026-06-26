@@ -68,6 +68,9 @@ export interface SettingStore {
   bochaApiProxy: string;
   searxngApiProxy: string;
   searxngScope: string;
+  grokSearchApiKey: string;
+  grokSearchApiProxy: string;
+  grokSearchModel: string;
   parallelSearch: number;
   searchMaxResult: number;
   crawler: string;
@@ -167,6 +170,9 @@ export const defaultValues: SettingStore = {
   bochaApiProxy: "",
   searxngApiProxy: "",
   searxngScope: "all",
+  grokSearchApiKey: "",
+  grokSearchApiProxy: "",
+  grokSearchModel: "grok-4.20-fast",
   parallelSearch: 1,
   searchMaxResult: 5,
   crawler: "jina",

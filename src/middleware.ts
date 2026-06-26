@@ -25,6 +25,7 @@ const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || "";
 const EXA_API_KEY = process.env.EXA_API_KEY || "";
 const BOCHA_API_KEY = process.env.BOCHA_API_KEY || "";
+const GROK_SEARCH_API_KEY = process.env.GROK_SEARCH_API_KEY || "";
 // Disabled Provider
 const DISABLED_AI_PROVIDER = process.env.NEXT_PUBLIC_DISABLED_AI_PROVIDER || "";
 const DISABLED_SEARCH_PROVIDER =
@@ -731,6 +732,45 @@ export async function middleware(request: NextRequest) {
           headers: requestHeaders,
         },
       });
+    }
+  }
+  if (request.nextUrl.pathname.startsWith("/api/search/grok")) {
+    const authorization = request.headers.get("authorization") || "";
+    if (
+      request.method.toUpperCase() !== "POST" ||
+      !verifySignature(
+        authorization.substring(7),
+        accessPassword,
+        Date.now()
+      ) ||
+      disabledSearchProviders.includes("grok")
+    ) {
+      return NextResponse.json(
+        { error: ERRORS.NO_PERMISSIONS },
+        { status: 403 }
+      );
+    } else {
+      const apiKey = multiApiKeyPolling(GROK_SEARCH_API_KEY);
+      if (apiKey) {
+        const requestHeaders = new Headers();
+        requestHeaders.set(
+          "Content-Type",
+          request.headers.get("Content-Type") || "application/json"
+        );
+        requestHeaders.set("Authorization", `Bearer ${apiKey}`);
+        return NextResponse.next({
+          request: {
+            headers: requestHeaders,
+          },
+        });
+      } else {
+        return NextResponse.json(
+          {
+            error: ERRORS.NO_API_KEY,
+          },
+          { status: 500 }
+        );
+      }
     }
   }
   if (request.nextUrl.pathname.startsWith("/api/crawler")) {
