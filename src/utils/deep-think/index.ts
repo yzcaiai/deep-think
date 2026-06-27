@@ -1,6 +1,7 @@
 import {
   generateText,
   generateObject,
+  tool,
   type Tool,
   type JSONValue,
 } from "ai";
@@ -20,6 +21,7 @@ import {
   buildAskQuestionsPrompt,
   buildThinkingPlanPrompt,
 } from "./prompts";
+
 
 type ProviderOptions = Record<string, Record<string, JSONValue>>;
 type Tools = Record<string, Tool>;
@@ -59,6 +61,8 @@ export interface DeepThinkOptions {
     provider: string;
     maxResult?: number;
   };
+  /** 外部搜索回调：引擎通过此函数执行搜索（grok/tavily 等），思考模型按需调用 web_search 工具 */
+  searchFn?: (query: string) => Promise<{ sources: Source[]; images: ImageSource[] }>;
   /** 是否启用询问阶段 - 在开始前提出澄清问题 */
   enableAskQuestions?: boolean;
   /** 用户对询问的回答（如果有的话） */
@@ -159,6 +163,31 @@ export class DeepThinkEngine {
 
     const { thinkingModel } = this.options;
     const { provider = "model", maxResult = 5 } = this.options.searchProvider || {};
+
+    // 外部搜索 provider（grok/tavily 等）：创建 web_search 工具，模型推理时按需调用
+    if (provider !== "model" && this.options.searchFn) {
+      const searchFn = this.options.searchFn;
+      return {
+        web_search: tool({
+          description:
+            "搜索互联网获取实时、真实的信息。当问题需要最新数据、外部事实或需要验证不确定的信息时主动调用。",
+          parameters: z.object({
+            query: z.string().describe("搜索查询词"),
+          }),
+          execute: async ({ query }) => {
+            const { sources } = await searchFn(query);
+            sources.forEach((s) => this.sources.push(s));
+            if (sources.length === 0) return "未找到相关结果。";
+            return sources
+              .map(
+                (s, i) =>
+                  `[${i + 1}] ${s.title || s.url}\n${s.content || ""}`
+              )
+              .join("\n\n---\n\n");
+          },
+        }),
+      };
+    }
 
     // Enable OpenAI's built-in search tool
     if (
@@ -353,6 +382,7 @@ export class DeepThinkEngine {
       prompt: fullPrompt,
       tools: await this.getSearchTools(),
       providerOptions: this.getProviderOptions(),
+      maxSteps: 5,
     });
 
     // 提取搜索来源
@@ -391,6 +421,7 @@ export class DeepThinkEngine {
       ],
       tools: await this.getSearchTools(),
       providerOptions: this.getProviderOptions(),
+      maxSteps: 5,
     });
 
     // 提取搜索来源
@@ -523,6 +554,7 @@ export class DeepThinkEngine {
           ],
           tools: await this.getSearchTools(),
           providerOptions: this.getProviderOptions(),
+          maxSteps: 5,
         });
 
         // 提取搜索来源
@@ -680,6 +712,31 @@ export class UltraThinkEngine {
 
     const { thinkingModel } = this.options;
     const { provider = "model", maxResult = 5 } = this.options.searchProvider || {};
+
+    // 外部搜索 provider（grok/tavily 等）：创建 web_search 工具，模型推理时按需调用
+    if (provider !== "model" && this.options.searchFn) {
+      const searchFn = this.options.searchFn;
+      return {
+        web_search: tool({
+          description:
+            "搜索互联网获取实时、真实的信息。当问题需要最新数据、外部事实或需要验证不确定的信息时主动调用。",
+          parameters: z.object({
+            query: z.string().describe("搜索查询词"),
+          }),
+          execute: async ({ query }) => {
+            const { sources } = await searchFn(query);
+            sources.forEach((s) => this.sources.push(s));
+            if (sources.length === 0) return "未找到相关结果。";
+            return sources
+              .map(
+                (s, i) =>
+                  `[${i + 1}] ${s.title || s.url}\n${s.content || ""}`
+              )
+              .join("\n\n---\n\n");
+          },
+        }),
+      };
+    }
 
     // Enable OpenAI's built-in search tool
     if (

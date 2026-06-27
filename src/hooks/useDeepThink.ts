@@ -16,7 +16,6 @@ import { runPreSearchPhase } from "@/utils/deep-think/preSearch";
 import { parseError } from "@/utils/error";
 import { isNetworkingModel } from "@/utils/model";
 
-// 交互式Deep Think的状态接口
 interface InteractiveDeepThinkState {
   isWaitingForAnswers: boolean;
   questions?: string;
@@ -121,6 +120,30 @@ function useDeepThinkEngine() {
     }
   }
 
+  /** 兜底：引擎启动前先搜一波资料，注入 knowledgeContext */
+  async function runPreSearchFallback(
+    problemStatement: string,
+    searchModel: string,
+    userAnswers?: string,
+  ): Promise<{ sources: Source[]; context: string }> {
+    handleProgress({ type: "progress", data: { message: "Pre-search: 分析问题，搜索外部资料..." } });
+    try {
+      const modelProvider = await createModelProvider(searchModel);
+      const result = await runPreSearchPhase(problemStatement, modelProvider, search, {
+        userAnswers,
+        maxRounds: 2,
+        onProgress: (msg) => handleProgress({ type: "progress", data: { message: msg } }),
+      });
+      if (result.allSources.length > 0) {
+        handleProgress({ type: "progress", data: { message: `Pre-search: 完成 — ${result.allSources.length} 条结果` } });
+      }
+      return { sources: result.allSources, context: result.formattedContext };
+    } catch (err) {
+      console.warn("Pre-search failed, continuing:", err);
+      return { sources: [], context: "" };
+    }
+  }
+
   async function runDeepThinkMode(
     problemStatement: string,
     otherPrompts: string[] = [],
@@ -143,12 +166,11 @@ function useDeepThinkEngine() {
         enablePlanning,
       } = useSettingStore.getState();
 
-      // 检查是否启用联网：模型内置搜索要求模型本身支持联网；外部 provider（grok/tavily…）无此限制
-      const enableWebSearch =
-        enableSearch &&
+      const enableWebSearch = enableSearch === "1" &&
         (searchProvider === "model" ? isNetworkingModel(model) : true);
+      const useExternalSearch = enableWebSearch && searchProvider !== "model";
+      const searchFn = useExternalSearch ? (q: string) => search(q) : undefined;
 
-      // 构建分阶段模型配置
       const modelStages = enableModelStages === "enable" ? {
         initial: modelStageInitial || undefined,
         improvement: modelStageImprovement || undefined,
@@ -158,42 +180,18 @@ function useDeepThinkEngine() {
         search: modelStageSearch || undefined,
       } : undefined;
 
-      // === Pre-search 阶段：外部搜索 provider（grok 等）在 DT 运行前主动搜资料 ===
-      // 不依赖 DT 引擎内部的 tool-calling——纯推理模型也能拿到真实资料
+      // 兜底：引擎启动前搜索。结果注入 knowledgeContext，让 DT 模型在 prompt 里直接引用
       let preSearchSources: Source[] = [];
-      let preSearchContext: string | undefined;
-
-      if (enableWebSearch && searchProvider !== "model") {
-        handleProgress({
-          type: "progress",
-          data: { message: "Pre-search: 分析问题，生成搜索计划..." },
-        });
-
-        try {
-          const searchModel = modelStages?.search || model;
-          const modelProvider = await createModelProvider(searchModel);
-          const preSearchResult = await runPreSearchPhase(
-            problemStatement,
-            modelProvider,
-            (q: string) => search(q),
-            {
-              maxRounds: 3,
-              onProgress: (msg) => {
-                handleProgress({ type: "progress", data: { message: msg } });
-              },
-            }
-          );
-
-          preSearchSources = preSearchResult.allSources;
-          preSearchContext = preSearchResult.formattedContext;
-
-          if (preSearchContext) {
-            knowledgeContext = knowledgeContext
-              ? `${knowledgeContext}\n\n${preSearchContext}`
-              : preSearchContext;
-          }
-        } catch (err) {
-          console.warn("Pre-search phase failed, continuing without search results:", err);
+      if (useExternalSearch) {
+        const pre = await runPreSearchFallback(
+          problemStatement,
+          modelStages?.search || model,
+        );
+        preSearchSources = pre.sources;
+        if (pre.context) {
+          knowledgeContext = knowledgeContext
+            ? `${pre.context}\n\n${knowledgeContext}`
+            : pre.context;
         }
       }
 
@@ -201,10 +199,11 @@ function useDeepThinkEngine() {
         problemStatement,
         otherPrompts,
         knowledgeContext,
-        enableWebSearch: enableWebSearch || undefined,
+        enableWebSearch,
         searchProvider: enableWebSearch
           ? { provider: searchProvider, maxResult: searchMaxResult }
           : undefined,
+        searchFn,
         enableAskQuestions: enableAskQuestions === "enable",
         enablePlanning: enablePlanning === "enable",
         createModelProvider,
@@ -213,15 +212,10 @@ function useDeepThinkEngine() {
         onProgress: handleProgress,
       });
 
-      // 合并 pre-search 来源到最终结果
       if (result && preSearchSources.length > 0) {
-        result.sources = [
-          ...preSearchSources,
-          ...(result.sources || []),
-        ];
+        result.sources = mergeSources(preSearchSources, result.sources);
         result.knowledgeEnhanced = true;
       }
-
       return result;
     } catch (err) {
       handleError(err);
@@ -231,7 +225,7 @@ function useDeepThinkEngine() {
 
   async function runUltraThinkMode(
     problemStatement: string,
-    numAgents?: number, // Optional: if not set, LLM decides
+    numAgents?: number,
     otherPrompts: string[] = [],
     knowledgeContext?: string
   ): Promise<UltraThinkResult | null> {
@@ -257,12 +251,11 @@ function useDeepThinkEngine() {
         enablePlanning,
       } = useSettingStore.getState();
 
-      // 检查是否启用联网：模型内置搜索要求模型本身支持联网；外部 provider（grok/tavily…）无此限制
-      const enableWebSearch =
-        enableSearch &&
+      const enableWebSearch = enableSearch === "1" &&
         (searchProvider === "model" ? isNetworkingModel(model) : true);
+      const useExternalSearch = enableWebSearch && searchProvider !== "model";
+      const searchFn = useExternalSearch ? (q: string) => search(q) : undefined;
 
-      // 构建分阶段模型配置
       const modelStages = enableModelStages === "enable" ? {
         initial: modelStageInitial || undefined,
         improvement: modelStageImprovement || undefined,
@@ -276,7 +269,6 @@ function useDeepThinkEngine() {
         search: modelStageSearch || undefined,
       } : undefined;
 
-      // 初始化 agents - 如果指定了 numAgents，预先创建占位符
       if (numAgents) {
         const initialAgents: AgentResult[] = Array.from(
           { length: numAgents },
@@ -290,45 +282,20 @@ function useDeepThinkEngine() {
         );
         setAgentResults(initialAgents);
       } else {
-        // 如果没指定，清空之前的结果，等 LLM 决定
         setAgentResults([]);
       }
 
-      // === Pre-search 阶段：外部搜索 provider 在 DT 运行前主动搜资料 ===
       let preSearchSources: Source[] = [];
-      let preSearchContext: string | undefined;
-
-      if (enableWebSearch && searchProvider !== "model") {
-        handleProgress({
-          type: "progress",
-          data: { message: "Pre-search: 分析问题，生成搜索计划..." },
-        });
-
-        try {
-          const searchModel = modelStages?.search || model;
-          const modelProvider = await createModelProvider(searchModel);
-          const preSearchResult = await runPreSearchPhase(
-            problemStatement,
-            modelProvider,
-            (q: string) => search(q),
-            {
-              maxRounds: 3,
-              onProgress: (msg) => {
-                handleProgress({ type: "progress", data: { message: msg } });
-              },
-            }
-          );
-
-          preSearchSources = preSearchResult.allSources;
-          preSearchContext = preSearchResult.formattedContext;
-
-          if (preSearchContext) {
-            knowledgeContext = knowledgeContext
-              ? `${knowledgeContext}\n\n${preSearchContext}`
-              : preSearchContext;
-          }
-        } catch (err) {
-          console.warn("Pre-search phase failed, continuing without search results:", err);
+      if (useExternalSearch) {
+        const pre = await runPreSearchFallback(
+          problemStatement,
+          modelStages?.search || model,
+        );
+        preSearchSources = pre.sources;
+        if (pre.context) {
+          knowledgeContext = knowledgeContext
+            ? `${pre.context}\n\n${knowledgeContext}`
+            : pre.context;
         }
       }
 
@@ -336,13 +303,14 @@ function useDeepThinkEngine() {
         problemStatement,
         otherPrompts,
         knowledgeContext,
-        enableWebSearch: enableWebSearch || undefined,
+        enableWebSearch,
         searchProvider: enableWebSearch
           ? { provider: searchProvider, maxResult: searchMaxResult }
           : undefined,
+        searchFn,
         enableAskQuestions: enableAskQuestions === "enable",
         enablePlanning: enablePlanning === "enable",
-        numAgents, // Can be undefined - LLM will decide
+        numAgents,
         createModelProvider,
         thinkingModel: model,
         modelStages,
@@ -352,15 +320,10 @@ function useDeepThinkEngine() {
         },
       });
 
-      // 合并 pre-search 来源到最终结果
       if (result && preSearchSources.length > 0) {
-        result.sources = [
-          ...preSearchSources,
-          ...(result.sources || []),
-        ];
+        result.sources = mergeSources(preSearchSources, result.sources);
         result.knowledgeEnhanced = true;
       }
-
       return result;
     } catch (err) {
       handleError(err);
@@ -368,7 +331,6 @@ function useDeepThinkEngine() {
     }
   }
 
-  // 交互式Deep Think方法
   async function startInteractiveDeepThink(
     problemStatement: string,
     otherPrompts: string[] = [],
@@ -390,12 +352,11 @@ function useDeepThinkEngine() {
         enablePlanning,
       } = useSettingStore.getState();
 
-      // 检查是否启用联网：模型内置搜索要求模型本身支持联网；外部 provider（grok/tavily…）无此限制
-      const enableWebSearch =
-        enableSearch &&
+      const enableWebSearch = enableSearch === "1" &&
         (searchProvider === "model" ? isNetworkingModel(model) : true);
+      const useExternalSearch = enableWebSearch && searchProvider !== "model";
+      const searchFn = useExternalSearch ? (q: string) => search(q) : undefined;
 
-      // 构建分阶段模型配置
       const modelStages = enableModelStages === "enable" ? {
         initial: modelStageInitial || undefined,
         improvement: modelStageImprovement || undefined,
@@ -409,12 +370,13 @@ function useDeepThinkEngine() {
         problemStatement,
         otherPrompts,
         knowledgeContext,
-        enableWebSearch: enableWebSearch || undefined,
+        enableWebSearch,
         searchProvider: enableWebSearch
           ? { provider: searchProvider, maxResult: searchMaxResult }
           : undefined,
-        enableAskQuestions: true, // 启用问问题功能
-        enableInteractiveMode: true, // 启用交互模式
+        searchFn,
+        enableAskQuestions: true,
+        enableInteractiveMode: true,
         enablePlanning: enablePlanning === "enable",
         createModelProvider,
         thinkingModel: model,
@@ -422,16 +384,10 @@ function useDeepThinkEngine() {
         onProgress: handleProgress,
       };
 
-      // 保存选项供后续使用
       setInteractiveState(prev => ({ ...prev, originalOptions: options }));
 
-      // 创建引擎实例但不运行完整流程，只生成问题
       const engine = new DeepThinkEngine(options);
-      
-      // 手动调用问问题流程
       const questions = await engine.askQuestions(problemStatement, true);
-      
-      // 保存引擎实例
       setInteractiveState(prev => ({ ...prev, engine }));
 
       return { questions };
@@ -447,81 +403,47 @@ function useDeepThinkEngine() {
     }
 
     try {
-      // 重置交互状态
       setInteractiveState(prev => ({
         ...prev,
         isWaitingForAnswers: false,
         questions: undefined,
       }));
 
-      // 创建包含用户答案的新选项
-      const optionsWithAnswers: DeepThinkOptions = {
-        ...interactiveState.originalOptions,
-        userAnswers,
-        enableInteractiveMode: false, // 关闭交互模式，直接运行完整流程
-        onProgress: handleProgress, // 确保使用正确的进度处理器
-      };
+      let knowledgeContext = interactiveState.originalOptions.knowledgeContext;
+      const searchFn = interactiveState.originalOptions.searchFn;
+      const problem = interactiveState.originalOptions.problemStatement;
 
-      // === Pre-search 阶段：用户回答后、DT 运行前搜索 ===
       let preSearchSources: Source[] = [];
-
-      if (
-        optionsWithAnswers.enableWebSearch &&
-        optionsWithAnswers.searchProvider?.provider !== "model"
-      ) {
-        handleProgress({
-          type: "progress",
-          data: { message: "Pre-search: 分析问题，生成搜索计划..." },
-        });
-
-        try {
-          const searchModel =
-            optionsWithAnswers.modelStages?.search ||
-            optionsWithAnswers.thinkingModel;
-          const modelProvider = await createModelProvider(searchModel);
-          const preSearchResult = await runPreSearchPhase(
-            optionsWithAnswers.problemStatement,
-            modelProvider,
-            (q: string) => search(q),
-            {
-              userAnswers,
-              maxRounds: 3,
-              onProgress: (msg) => {
-                handleProgress({ type: "progress", data: { message: msg } });
-              },
-            }
-          );
-
-          preSearchSources = preSearchResult.allSources;
-          const searchContext = preSearchResult.formattedContext;
-
-          if (searchContext) {
-            optionsWithAnswers.knowledgeContext = optionsWithAnswers.knowledgeContext
-              ? `${optionsWithAnswers.knowledgeContext}\n\n${searchContext}`
-              : searchContext;
-          }
-        } catch (err) {
-          console.warn("Pre-search phase failed, continuing without search results:", err);
+      if (searchFn) {
+        const searchModel =
+          interactiveState.originalOptions.modelStages?.search ||
+          interactiveState.originalOptions.thinkingModel;
+        const pre = await runPreSearchFallback(problem, searchModel, userAnswers);
+        preSearchSources = pre.sources;
+        if (pre.context) {
+          knowledgeContext = knowledgeContext
+            ? `${pre.context}\n\n${knowledgeContext}`
+            : pre.context;
         }
       }
 
-      // 运行完整的Deep Think流程
+      const optionsWithAnswers: DeepThinkOptions = {
+        ...interactiveState.originalOptions,
+        knowledgeContext,
+        searchFn,
+        userAnswers,
+        enableInteractiveMode: false,
+        onProgress: handleProgress,
+      };
+
       const result = await runDeepThink(optionsWithAnswers);
 
-      // 合并 pre-search 来源到最终结果
       if (result && preSearchSources.length > 0) {
-        result.sources = [
-          ...preSearchSources,
-          ...(result.sources || []),
-        ];
+        result.sources = mergeSources(preSearchSources, result.sources);
         result.knowledgeEnhanced = true;
       }
 
-      // 清理交互状态
-      setInteractiveState({
-        isWaitingForAnswers: false,
-      });
-
+      setInteractiveState({ isWaitingForAnswers: false });
       return result;
     } catch (err) {
       handleError(err);
@@ -530,16 +452,13 @@ function useDeepThinkEngine() {
   }
 
   function resetInteractiveState() {
-    setInteractiveState({
-      isWaitingForAnswers: false,
-    });
+    setInteractiveState({ isWaitingForAnswers: false });
   }
 
   return {
     status,
     runDeepThinkMode,
     runUltraThinkMode,
-    // 交互式Deep Think相关
     interactiveState,
     startInteractiveDeepThink,
     continueWithAnswers,
@@ -547,5 +466,17 @@ function useDeepThinkEngine() {
   };
 }
 
-export default useDeepThinkEngine;
+/** 去重合并 sources */
+function mergeSources(a: Source[], b?: Source[]): Source[] {
+  const seen = new Set<string>();
+  const merged: Source[] = [];
+  for (const s of [...a, ...(b || [])]) {
+    if (!seen.has(s.url)) {
+      seen.add(s.url);
+      merged.push(s);
+    }
+  }
+  return merged;
+}
 
+export default useDeepThinkEngine;
