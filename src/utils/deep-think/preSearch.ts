@@ -1,17 +1,4 @@
 import { generateText } from "ai";
-import { z } from "zod";
-
-// ===== Schemas =====
-
-const searchPlanSchema = z.object({
-  searchQueries: z.array(z.string()).min(1).max(5),
-});
-
-const searchEvaluationSchema = z.object({
-  needMoreSearch: z.boolean(),
-  followUpQueries: z.array(z.string()).max(3),
-  gaps: z.string().optional(),
-});
 
 // ===== Types =====
 
