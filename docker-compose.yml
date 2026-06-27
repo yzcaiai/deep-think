@@ -1,10 +1,8 @@
 version: "3.9"
 services:
   deep-research:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: deep-research
+    image: ghcr.io/yzcaiai/deep-think:latest
+    pull_policy: always
     container_name: deep-research
     env_file:
       - .env
