@@ -301,26 +301,12 @@ ${analysisResult}
 Now create the final, polished response for the user. Start directly with the answer - no preamble about the process.`;
 };
 
-// 当启用外部搜索 provider（grok/tavily/exa…）时，注入此段以明确告诉思考模型
-// 有一个名为 web_search 的工具可按需调用，并据实引用、不得臆测。
-// 真实/不捏造/关键信息不省略的硬约束放在 grok 自身的 system prompt（search.ts），
-// 此处只负责让思考模型主动发起调用，不污染其推理提示词的价值取向。
-export const webSearchToolInstruction = `### Available Tool: web_search ###
-
-你有一个 web_search 工具。当问题需要最新数据、外部事实、或你不确定的信息时，主动调用 web_search 获取真实资料，并据实引用，不要臆测。搜索结果是真实网页的摘要，请基于其内容作答，不要编造搜索结果中不存在的事实。`;
-
 export function buildInitialThinkingPrompt(
   problemStatement: string,
   otherPrompts: string[] = [],
-  knowledgeContext?: string,
-  webSearchToolEnabled?: boolean
+  knowledgeContext?: string
 ): string {
   let prompt = deepThinkInitialPrompt;
-
-  // 注入 web_search 工具使用说明（仅当外部搜索 provider 启用时）
-  if (webSearchToolEnabled) {
-    prompt += "\n\n" + webSearchToolInstruction;
-  }
 
   // Add knowledge base context if available
   if (knowledgeContext && knowledgeContext.trim()) {

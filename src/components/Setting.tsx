@@ -182,6 +182,7 @@ const formSchema = z.object({
   modelStageAgentConfig: z.string().optional(),
   modelStageAgentThinking: z.string().optional(),
   modelStageSynthesis: z.string().optional(),
+  modelStageSearch: z.string().optional(),
   enableAskQuestions: z.enum(["enable", "disable"]).optional(),
   enablePlanning: z.enum(["enable", "disable"]).optional(),
 });
@@ -2244,6 +2245,7 @@ function Setting({ open, onClose }: SettingProps) {
                         { name: "modelStageAgentConfig", label: "Agent 配置", tip: "UltraThink 生成 Agent 配置阶段的模型。" },
                         { name: "modelStageAgentThinking", label: "Agent 思考", tip: "UltraThink Agent 并行思考阶段的模型。" },
                         { name: "modelStageSynthesis", label: "结果合成", tip: "UltraThink 合成最终结果阶段的模型。" },
+                        { name: "modelStageSearch", label: "搜索阶段", tip: "Pre-Search 阶段生成搜索计划和评估搜索结果的模型。留空使用默认思考模型。" },
                       ].map((stage) => (
                         <FormField
                           key={stage.name}
