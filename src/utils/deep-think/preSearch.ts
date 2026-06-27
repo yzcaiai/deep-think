@@ -1,4 +1,4 @@
-import { generateObject } from "ai";
+import { generateText } from "ai";
 import { z } from "zod";
 
 // ===== Schemas =====
@@ -24,6 +24,22 @@ export interface PreSearchResult {
   rounds: SearchRound[];
   allSources: Source[];
   formattedContext: string;
+}
+
+// ===== Helpers =====
+
+function tryExtractJson(text: string): any | null {
+  try {
+    // Try extracting from markdown code block first
+    const blockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (blockMatch) return JSON.parse(blockMatch[1].trim());
+    // Then try raw JSON in text
+    const braceMatch = text.match(/\{[\s\S]*\}/);
+    if (braceMatch) return JSON.parse(braceMatch[0]);
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 // ===== Formatting =====
@@ -58,6 +74,7 @@ function formatSourcesForEvaluation(rounds: SearchRound[]): string {
 
 /**
  * Step 1: 模型分析问题，生成搜索查询列表
+ * 使用 generateText + JSON 解析（兼容纯推理模型如 DeepSeek Reasoner）
  */
 export async function generateSearchPlan(
   problemStatement: string,
@@ -74,20 +91,22 @@ ${problemStatement}
     prompt += `\n\n<用户提供的额外背景>\n${userAnswers}\n</用户提供的额外背景>`;
   }
 
-  prompt += `\n\n请列出你需要搜索的关键信息方向。生成 3-5 个具体的搜索查询（用与问题相同的语言），每个查询针对问题的不同方面。查询要具体、可执行，能搜到真实有用的资料。`;
+  prompt += `\n\n请列出你需要搜索的关键信息方向。生成 3-5 个具体的搜索查询（用与问题相同的语言），每个查询针对问题的不同方面。查询要具体、可执行，能搜到真实有用的资料。
+
+以 JSON 格式输出（不要 markdown 代码块标记）：
+{"searchQueries": ["query1", "query2", "query3"]}`;
 
   try {
-    const result = await generateObject({
-      model,
-      schema: searchPlanSchema,
-      mode: "json",
-      prompt,
-    });
-    return result.object.searchQueries || [];
+    const result = await generateText({ model, prompt });
+    const parsed = tryExtractJson(result.text);
+    if (parsed?.searchQueries && Array.isArray(parsed.searchQueries)) {
+      return parsed.searchQueries.slice(0, 5).filter(Boolean);
+    }
   } catch {
-    // Fallback: use problemStatement as the only query
-    return [problemStatement];
+    // fallthrough
   }
+  // Fallback: use problemStatement as the only query
+  return [problemStatement];
 }
 
 /**
@@ -124,6 +143,7 @@ export async function executeSearchRound(
 
 /**
  * Step 3: 模型评估搜索结果，判断是否需要继续搜索
+ * 使用 generateText + JSON 解析
  */
 export async function evaluateSearchResults(
   problemStatement: string,
@@ -149,23 +169,25 @@ ${allResults}
 请评估：
 1. 搜索结果是否已经覆盖了问题的关键方面？
 2. 是否还有重要的信息缺口？
-3. 是否需要更多搜索来填补缺口？（注意：如果信息已经足够，不要过度搜索——最多再搜一轮）`;
+3. 是否需要更多搜索来填补缺口？（注意：如果信息已经足够，不要过度搜索——最多再搜一轮）
+
+以 JSON 格式输出（不要 markdown 代码块标记）：
+{"needMoreSearch": true/false, "followUpQueries": ["query1", "query2"], "gaps": "信息缺口描述"}`;
 
   try {
-    const result = await generateObject({
-      model,
-      schema: searchEvaluationSchema,
-      mode: "json",
-      prompt,
-    });
-    return {
-      needMoreSearch: result.object.needMoreSearch || false,
-      followUpQueries: result.object.followUpQueries || [],
-      gaps: result.object.gaps,
-    };
+    const result = await generateText({ model, prompt });
+    const parsed = tryExtractJson(result.text);
+    if (parsed) {
+      return {
+        needMoreSearch: parsed.needMoreSearch === true,
+        followUpQueries: Array.isArray(parsed.followUpQueries) ? parsed.followUpQueries.slice(0, 3).filter(Boolean) : [],
+        gaps: typeof parsed.gaps === "string" ? parsed.gaps : undefined,
+      };
+    }
   } catch {
-    return { needMoreSearch: false, followUpQueries: [] };
+    // fallthrough
   }
+  return { needMoreSearch: false, followUpQueries: [] };
 }
 
 /**
@@ -193,7 +215,7 @@ export async function runPreSearchPhase(
   const seenUrls = new Set<string>();
 
   // Round 1: Model generates search plan
-  options?.onProgress?.("分析问题，生成搜索计划...");
+  options?.onProgress?.("Pre-search: 分析问题，生成搜索计划...");
   const initialQueries = await generateSearchPlan(
     problemStatement,
     model,
@@ -201,16 +223,17 @@ export async function runPreSearchPhase(
   );
 
   if (!initialQueries || initialQueries.length === 0) {
+    options?.onProgress?.("Pre-search: 未生成搜索查询，跳过");
     return { rounds: [], allSources: [], formattedContext: "" };
   }
 
-  options?.onProgress?.(`搜索计划: ${initialQueries.join("; ")}`);
+  options?.onProgress?.(`Pre-search: 搜索计划 - ${initialQueries.join(" | ")}`);
 
   // Execute first round
   const round1 = await executeSearchRound(
     initialQueries,
     searchFn,
-    options?.onProgress
+    (msg) => options?.onProgress?.(`Pre-search: ${msg}`)
   );
   rounds.push(round1);
   for (const s of round1.sources) {
@@ -220,7 +243,13 @@ export async function runPreSearchPhase(
     }
   }
 
-  options?.onProgress?.(`第 1 轮搜索完成: ${round1.sources.length} 条结果`);
+  options?.onProgress?.(`Pre-search: 第 1 轮完成，${round1.sources.length} 条结果`);
+
+  // If first round got 0 results, don't bother evaluating — skip to end
+  if (allSources.length === 0) {
+    options?.onProgress?.("Pre-search: 搜索未返回结果，跳过后续轮次");
+    return { rounds, allSources: [], formattedContext: "" };
+  }
 
   // Additional rounds: Model evaluates and decides if more search needed
   for (let r = 1; r < maxRounds; r++) {
@@ -231,18 +260,18 @@ export async function runPreSearchPhase(
     );
 
     if (!evaluation.needMoreSearch || evaluation.followUpQueries.length === 0) {
-      options?.onProgress?.("搜索资料已充分，停止搜索");
+      options?.onProgress?.("Pre-search: 搜索资料已充分");
       break;
     }
 
     options?.onProgress?.(
-      `信息缺口: ${evaluation.gaps || "需要补充搜索"}。执行第 ${r + 1} 轮搜索...`
+      `Pre-search: 信息缺口 - ${evaluation.gaps || "需补充搜索"}。第 ${r + 1} 轮...`
     );
 
     const round = await executeSearchRound(
       evaluation.followUpQueries,
       searchFn,
-      options?.onProgress
+      (msg) => options?.onProgress?.(`Pre-search: ${msg}`)
     );
     rounds.push(round);
     for (const s of round.sources) {
@@ -252,10 +281,10 @@ export async function runPreSearchPhase(
       }
     }
 
-    options?.onProgress?.(`第 ${r + 1} 轮搜索完成: ${round.sources.length} 条新结果`);
+    options?.onProgress?.(`Pre-search: 第 ${r + 1} 轮完成，+${round.sources.length} 条新结果`);
   }
 
-  options?.onProgress?.(`搜索阶段完成: ${rounds.length} 轮，共 ${allSources.length} 条去重结果`);
+  options?.onProgress?.(`Pre-search: 完成 — ${rounds.length} 轮，${allSources.length} 条去重结果`);
 
   return {
     rounds,
