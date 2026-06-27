@@ -303,14 +303,23 @@ export async function createSearchProvider({
           messages: [
             {
               role: "system",
-              content: `You are a web research assistant. Search the web for the given query and return structured results.
-For each source found, include the title, URL, and a comprehensive content summary.
-Always end with a "Sources" section listing all URLs used.
-Respond in the same language as the query.`,
+              content: `你是网页搜索助手。对每条搜索结果严格按以下格式逐条输出，不要合并条目：
+
+### {网页标题}
+URL: {该结果的真实网址}
+{该网页的详细摘要}
+
+格式与内容要求：
+- 每条结果必须以 "### " 开头，紧接网页标题；下一行必须是 "URL: " 开头并跟该结果的真实网址；再下一行起是该网页的摘要正文。
+- 摘要必须忠于搜索到的原文，禁止捏造、脑补或臆测；没有真正搜到的内容一律不写。
+- 摘要要保留关键事实、数据、名称、结论等关键信息，宁可详细也不要省略关键点；表述可以简短，但不准丢关键信息。
+- 每条结果的 URL 必须真实存在且对应其内容；不要在摘要正文里引用与该条无关的其他网址。
+- 逐条输出，条目之间用一个空行分隔；最后不要再额外添加 "Sources" 或参考文献列表。
+- 用与查询相同的语言输出。`,
             },
             {
               role: "user",
-              content: `Search for: ${query}\n\nProvide detailed information from search results. Include relevant facts, data, and cite your sources with URLs.`,
+              content: `搜索：${query}`,
             },
           ],
           // Add random seed + timestamp to avoid cached/stale responses
@@ -322,19 +331,26 @@ Respond in the same language as the query.`,
     );
     const data = await response.json();
     const content = String(data.choices?.[0]?.message?.content ?? "");
-    // Parse sources from the response content by extracting URLs
-    const urlRegex = /https?:\/\/[^\s\)\]}」』」」」」」」]+/g;
-    const urls: string[] = content.match(urlRegex) ?? [];
-    const uniqueUrls = [...new Set<string>(urls)];
+    // 按块切分：每个 "### " 块为一条结果，取 URL: 锚点 + 该块正文作为独立 content
+    const blocks = content
+      .split(/^###\s+/m)
+      .map((block) => block.trim())
+      .filter(Boolean);
+    const sources: Source[] = [];
+    for (const block of blocks) {
+      const urlMatch = block.match(/^URL:\s*(\S+)/im);
+      if (!urlMatch) continue;
+      const firstLine = block.split("\n")[0].trim();
+      const title = firstLine.replace(/^\[.*?\]\s*/, "").trim();
+      const body = block.replace(/^URL:\s*\S+/im, "").trim();
+      sources.push({
+        url: urlMatch[1],
+        title: title || "",
+        content: body,
+      });
+    }
 
-    return {
-      sources: uniqueUrls.map((url) => ({
-        content,
-        url,
-        title: "",
-      })) as Source[],
-      images: [],
-    };
+    return { sources, images: [] };
   } else if (provider === "searxng") {
     const params = {
       q: query,

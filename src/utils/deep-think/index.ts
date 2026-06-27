@@ -1,4 +1,10 @@
-import { generateText, generateObject, type Tool, type JSONValue } from "ai";
+import {
+  generateText,
+  generateObject,
+  tool,
+  type Tool,
+  type JSONValue,
+} from "ai";
 import { z } from "zod";
 import {
   deepThinkInitialPrompt,
@@ -7,6 +13,7 @@ import {
   correctionPrompt,
   buildVerificationPrompt,
   buildInitialThinkingPrompt,
+  webSearchToolInstruction,
   extractDetailedSolutionMarker,
   ultraThinkPlanPrompt,
   generateAgentPromptsPrompt,
@@ -52,6 +59,11 @@ export interface DeepThinkOptions {
     provider: string;
     maxResult?: number;
   };
+  /** 外部搜索 provider 的回调（grok/tavily/exa…）；engine 据此暴露 web_search 工具供思考模型按需调用 */
+  searchFn?: (query: string) => Promise<{
+    sources: Source[];
+    images: ImageSource[];
+  }>;
   /** 是否启用询问阶段 - 在开始前提出澄清问题 */
   enableAskQuestions?: boolean;
   /** 用户对询问的回答（如果有的话） */
@@ -153,6 +165,38 @@ export class DeepThinkEngine {
     const { thinkingModel } = this.options;
     const { provider = "model", maxResult = 5 } = this.options.searchProvider || {};
 
+    // 外部搜索 provider（grok/tavily/exa…）→ 包成 web_search 工具供思考模型按需调用
+    if (provider !== "model" && this.options.searchFn) {
+      const searchFn = this.options.searchFn;
+      return {
+        web_search: tool({
+          description:
+            "Search the web for real-time, factual information via the configured search provider. Call it when the problem needs current data, external facts, or to verify claims you're unsure about. The tool returns structured results with URLs.",
+          parameters: z.object({
+            query: z.string().describe("The search query."),
+          }),
+          execute: async ({ query }) => {
+            try {
+              const { sources } = await searchFn(query);
+              if (sources.length > 0) {
+                sources.forEach((s) => this.sources.push(s));
+              }
+              return sources
+                .map(
+                  (s, i) =>
+                    `[${i + 1}] ${s.title || s.url}\nURL: ${s.url}\n${s.content || ""}`
+                )
+                .join("\n\n---\n\n");
+            } catch (err) {
+              return `Search failed: ${
+                err instanceof Error ? err.message : String(err)
+              }`;
+            }
+          },
+        }),
+      };
+    }
+
     // Enable OpenAI's built-in search tool
     if (
       provider === "model" &&
@@ -190,6 +234,17 @@ export class DeepThinkEngine {
     }
 
     return undefined;
+  }
+
+  /**
+   * 是否启用了外部搜索 provider 的 web_search 工具路径
+   * （grok/tavily/exa… + searchFn 回调）。据此决定是否向思考模型注入工具使用说明。
+   * 与 openai/openrouter 内置搜索路径互斥：内置路径不需要（也调不动）web_search 工具。
+   */
+  private webSearchToolEnabled(): boolean {
+    if (!this.options.enableWebSearch) return false;
+    const { provider = "model" } = this.options.searchProvider || {};
+    return provider !== "model" && !!this.options.searchFn;
   }
 
   private extractDetailedSolution(
@@ -337,7 +392,8 @@ export class DeepThinkEngine {
     const fullPrompt = buildInitialThinkingPrompt(
       problemStatement,
       otherPrompts,
-      this.options.knowledgeContext
+      this.options.knowledgeContext,
+      this.webSearchToolEnabled()
     );
 
     // First solution
@@ -346,6 +402,7 @@ export class DeepThinkEngine {
       prompt: fullPrompt,
       tools: await this.getSearchTools(),
       providerOptions: this.getProviderOptions(),
+      maxSteps: 5,
     });
 
     // 提取搜索来源
@@ -367,16 +424,21 @@ export class DeepThinkEngine {
     const improvementModel = this.getModelForStage("improvement");
     const improvementModelProvider = await this.options.createModelProvider(improvementModel);
 
-    const systemPromptWithKnowledge = this.options.knowledgeContext
+    const improvementSystemPrompt = this.options.knowledgeContext
       ? deepThinkInitialPrompt +
         "\n\n### Available Knowledge Base ###\n\n" +
         this.options.knowledgeContext +
         "\n\n### End of Knowledge Base ###\n"
       : deepThinkInitialPrompt;
 
+    // 自我改进阶段同样可按需调用 web_search（外部 provider 路径）
+    const improvementSystemWithSearch = this.webSearchToolEnabled()
+      ? improvementSystemPrompt + "\n\n" + webSearchToolInstruction
+      : improvementSystemPrompt;
+
     const improvementResult = await generateText({
       model: improvementModelProvider,
-      system: systemPromptWithKnowledge,
+      system: improvementSystemWithSearch,
       messages: [
         { role: "user", content: problemStatement },
         { role: "assistant", content: firstSolution },
@@ -384,6 +446,7 @@ export class DeepThinkEngine {
       ],
       tools: await this.getSearchTools(),
       providerOptions: this.getProviderOptions(),
+      maxSteps: 5,
     });
 
     // 提取搜索来源
@@ -496,16 +559,21 @@ export class DeepThinkEngine {
         const correctionModel = this.getModelForStage("correction");
         const model = await this.options.createModelProvider(correctionModel);
 
-        const systemPromptWithKnowledge = this.options.knowledgeContext
+        const correctionSystemPrompt = this.options.knowledgeContext
           ? deepThinkInitialPrompt +
             "\n\n### Available Knowledge Base ###\n\n" +
             this.options.knowledgeContext +
             "\n\n### End of Knowledge Base ###\n"
           : deepThinkInitialPrompt;
 
+        // 修正阶段同样可按需调用 web_search 验证/补全事实（外部 provider 路径）
+        const correctionSystemWithSearch = this.webSearchToolEnabled()
+          ? correctionSystemPrompt + "\n\n" + webSearchToolInstruction
+          : correctionSystemPrompt;
+
         const correctionResult = await generateText({
           model,
-          system: systemPromptWithKnowledge,
+          system: correctionSystemWithSearch,
           messages: [
             { role: "user", content: problemStatement },
             { role: "assistant", content: solution },
@@ -516,6 +584,7 @@ export class DeepThinkEngine {
           ],
           tools: await this.getSearchTools(),
           providerOptions: this.getProviderOptions(),
+          maxSteps: 5,
         });
 
         // 提取搜索来源
@@ -673,6 +742,38 @@ export class UltraThinkEngine {
 
     const { thinkingModel } = this.options;
     const { provider = "model", maxResult = 5 } = this.options.searchProvider || {};
+
+    // 外部搜索 provider（grok/tavily/exa…）→ 包成 web_search 工具供思考模型按需调用
+    if (provider !== "model" && this.options.searchFn) {
+      const searchFn = this.options.searchFn;
+      return {
+        web_search: tool({
+          description:
+            "Search the web for real-time, factual information via the configured search provider. Call it when the problem needs current data, external facts, or to verify claims you're unsure about. The tool returns structured results with URLs.",
+          parameters: z.object({
+            query: z.string().describe("The search query."),
+          }),
+          execute: async ({ query }) => {
+            try {
+              const { sources } = await searchFn(query);
+              if (sources.length > 0) {
+                sources.forEach((s) => this.sources.push(s));
+              }
+              return sources
+                .map(
+                  (s, i) =>
+                    `[${i + 1}] ${s.title || s.url}\nURL: ${s.url}\n${s.content || ""}`
+                )
+                .join("\n\n---\n\n");
+            } catch (err) {
+              return `Search failed: ${
+                err instanceof Error ? err.message : String(err)
+              }`;
+            }
+          },
+        }),
+      };
+    }
 
     // Enable OpenAI's built-in search tool
     if (

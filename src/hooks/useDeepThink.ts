@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import useModelProvider from "@/hooks/useAiProvider";
+import useWebSearch from "@/hooks/useWebSearch";
 import { useGlobalStore } from "@/store/global";
 import { useSettingStore } from "@/store/setting";
 import {
@@ -25,6 +26,7 @@ interface InteractiveDeepThinkState {
 function useDeepThinkEngine() {
   const { t } = useTranslation();
   const { createModelProvider, getModel } = useModelProvider();
+  const { search } = useWebSearch();
   const [status, setStatus] = useState<string>("");
   const [interactiveState, setInteractiveState] = useState<InteractiveDeepThinkState>({
     isWaitingForAnswers: false,
@@ -125,9 +127,10 @@ function useDeepThinkEngine() {
   ): Promise<DeepThinkResult | null> {
     try {
       const { model } = getModel();
-      const { 
-        enableSearch, 
+      const {
+        enableSearch,
         searchProvider,
+        searchMaxResult,
         enableModelStages,
         modelStageInitial,
         modelStageImprovement,
@@ -138,10 +141,10 @@ function useDeepThinkEngine() {
         enablePlanning,
       } = useSettingStore.getState();
 
-      // 检查模型是否支持网页搜索
-      const enableWebSearch = enableSearch && 
-        searchProvider === "model" && 
-        isNetworkingModel(model);
+      // 检查是否启用联网：模型内置搜索要求模型本身支持联网；外部 provider（grok/tavily…）无此限制
+      const enableWebSearch =
+        enableSearch &&
+        (searchProvider === "model" ? isNetworkingModel(model) : true);
 
       // 构建分阶段模型配置
       const modelStages = enableModelStages === "enable" ? {
@@ -157,7 +160,13 @@ function useDeepThinkEngine() {
         otherPrompts,
         knowledgeContext,
         enableWebSearch: enableWebSearch || undefined,
-        searchProvider: enableWebSearch ? { provider: "model", maxResult: 5 } : undefined,
+        searchProvider: enableWebSearch
+          ? { provider: searchProvider, maxResult: searchMaxResult }
+          : undefined,
+        searchFn:
+          searchProvider !== "model" && enableWebSearch
+            ? (q: string) => search(q)
+            : undefined,
         enableAskQuestions: enableAskQuestions === "enable",
         enablePlanning: enablePlanning === "enable",
         createModelProvider,
@@ -182,9 +191,10 @@ function useDeepThinkEngine() {
     try {
       const { model } = getModel();
       const { setAgentResults, updateAgentResult } = useGlobalStore.getState();
-      const { 
-        enableSearch, 
+      const {
+        enableSearch,
         searchProvider,
+        searchMaxResult,
         enableModelStages,
         modelStageInitial,
         modelStageImprovement,
@@ -199,10 +209,10 @@ function useDeepThinkEngine() {
         enablePlanning,
       } = useSettingStore.getState();
 
-      // 检查模型是否支持网页搜索
-      const enableWebSearch = enableSearch && 
-        searchProvider === "model" && 
-        isNetworkingModel(model);
+      // 检查是否启用联网：模型内置搜索要求模型本身支持联网；外部 provider（grok/tavily…）无此限制
+      const enableWebSearch =
+        enableSearch &&
+        (searchProvider === "model" ? isNetworkingModel(model) : true);
 
       // 构建分阶段模型配置
       const modelStages = enableModelStages === "enable" ? {
@@ -240,7 +250,13 @@ function useDeepThinkEngine() {
         otherPrompts,
         knowledgeContext,
         enableWebSearch: enableWebSearch || undefined,
-        searchProvider: enableWebSearch ? { provider: "model", maxResult: 5 } : undefined,
+        searchProvider: enableWebSearch
+          ? { provider: searchProvider, maxResult: searchMaxResult }
+          : undefined,
+        searchFn:
+          searchProvider !== "model" && enableWebSearch
+            ? (q: string) => search(q)
+            : undefined,
         enableAskQuestions: enableAskQuestions === "enable",
         enablePlanning: enablePlanning === "enable",
         numAgents, // Can be undefined - LLM will decide
@@ -268,9 +284,10 @@ function useDeepThinkEngine() {
   ): Promise<{ questions?: string } | null> {
     try {
       const { model } = getModel();
-      const { 
-        enableSearch, 
+      const {
+        enableSearch,
         searchProvider,
+        searchMaxResult,
         enableModelStages,
         modelStageInitial,
         modelStageImprovement,
@@ -280,10 +297,10 @@ function useDeepThinkEngine() {
         enablePlanning,
       } = useSettingStore.getState();
 
-      // 检查模型是否支持网页搜索
-      const enableWebSearch = enableSearch && 
-        searchProvider === "model" && 
-        isNetworkingModel(model);
+      // 检查是否启用联网：模型内置搜索要求模型本身支持联网；外部 provider（grok/tavily…）无此限制
+      const enableWebSearch =
+        enableSearch &&
+        (searchProvider === "model" ? isNetworkingModel(model) : true);
 
       // 构建分阶段模型配置
       const modelStages = enableModelStages === "enable" ? {
@@ -299,7 +316,13 @@ function useDeepThinkEngine() {
         otherPrompts,
         knowledgeContext,
         enableWebSearch: enableWebSearch || undefined,
-        searchProvider: enableWebSearch ? { provider: "model", maxResult: 5 } : undefined,
+        searchProvider: enableWebSearch
+          ? { provider: searchProvider, maxResult: searchMaxResult }
+          : undefined,
+        searchFn:
+          searchProvider !== "model" && enableWebSearch
+            ? (q: string) => search(q)
+            : undefined,
         enableAskQuestions: true, // 启用问问题功能
         enableInteractiveMode: true, // 启用交互模式
         enablePlanning: enablePlanning === "enable",
