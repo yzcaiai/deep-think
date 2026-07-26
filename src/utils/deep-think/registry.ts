@@ -41,7 +41,12 @@ export function schedule<T>(
   const controller = new AbortController();
   controllers.set(taskId, controller);
   return limit(() => fn(controller.signal)).finally(() => {
-    controllers.delete(taskId);
+    // 只清理自己登记的那个 —— 任务被取消后立刻续跑时，
+    // Map 里已是新一轮的 controller，旧回调不能把它删掉，
+    // 否则新一轮就再也取消不了了
+    if (controllers.get(taskId) === controller) {
+      controllers.delete(taskId);
+    }
   });
 }
 
