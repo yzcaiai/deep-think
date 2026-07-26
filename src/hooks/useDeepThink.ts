@@ -1,10 +1,10 @@
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import useModelProvider from "@/hooks/useAiProvider";
 import useWebSearch from "@/hooks/useWebSearch";
-import { useGlobalStore } from "@/store/global";
 import { useSettingStore } from "@/store/setting";
+import { useThinkTaskStore, type CreateTaskInput } from "@/store/thinkTask";
+import { useHistoryStore } from "@/store/history";
 import {
   runDeepThink,
   runUltraThink,
@@ -13,456 +13,671 @@ import {
   type DeepThinkOptions,
 } from "@/utils/deep-think";
 import { runPreSearchPhase } from "@/utils/deep-think/preSearch";
+import { schedule, cancel, isAbortError } from "@/utils/deep-think/registry";
 import { parseError } from "@/utils/error";
 import { isNetworkingModel } from "@/utils/model";
 
-interface InteractiveDeepThinkState {
-  isWaitingForAnswers: boolean;
-  questions?: string;
-  engine?: DeepThinkEngine;
-  originalOptions?: DeepThinkOptions;
-}
+/**
+ * 交互式 Deep Think 的活对象（引擎实例 + 原始 options）。
+ * 不可序列化，因此按 taskId 存模块级 Map，不进 zustand store。
+ */
+const interactiveSessions = new Map<
+  string,
+  { engine: DeepThinkEngine; options: DeepThinkOptions }
+>();
 
 function useDeepThinkEngine() {
   const { t } = useTranslation();
   const { createModelProvider, getModel } = useModelProvider();
   const { search } = useWebSearch();
-  const [status, setStatus] = useState<string>("");
-  const [interactiveState, setInteractiveState] = useState<InteractiveDeepThinkState>({
-    isWaitingForAnswers: false,
-  });
 
-  function handleError(error: unknown) {
-    console.error(error);
-    const errorMessage = parseError(error);
-    toast.error(errorMessage);
+  /** 只在该任务正被展示时才打扰用户 */
+  function isActiveTask(taskId: string): boolean {
+    return useThinkTaskStore.getState().activeTaskId === taskId;
   }
 
-  function handleProgress(event: DeepThinkProgressEvent) {
-    const {
-      setCurrentIteration,
-      setCurrentPhase,
-      setCurrentSolution,
-    } = useGlobalStore.getState();
+  function handleError(taskId: string, error: unknown): string {
+    console.error(error);
+    const errorMessage = parseError(error);
+    if (isActiveTask(taskId)) toast.error(errorMessage);
+    return errorMessage;
+  }
+
+  function handleProgress(taskId: string, event: DeepThinkProgressEvent) {
+    const { update } = useThinkTaskStore.getState();
 
     switch (event.type) {
       case "init":
-        setStatus(t("deepThink.status.initializing"));
-        setCurrentIteration(0);
-        setCurrentPhase("initializing");
+        update(taskId, {
+          statusText: t("deepThink.status.initializing"),
+          currentIteration: 0,
+          currentPhase: "initializing",
+        });
         break;
       case "asking":
-        setCurrentPhase("asking");
-        setStatus(t("deepThink.status.asking"));
+        update(taskId, {
+          currentPhase: "asking",
+          statusText: t("deepThink.status.asking"),
+        });
         break;
       case "waiting_for_answers":
-        setCurrentPhase("waiting_for_answers");
-        setStatus(t("deepThink.status.waitingForAnswers"));
-        setInteractiveState(prev => ({
-          ...prev,
+        update(taskId, {
+          status: "waiting",
+          currentPhase: "waiting_for_answers",
+          statusText: t("deepThink.status.waitingForAnswers"),
           isWaitingForAnswers: true,
           questions: event.data.questions,
-        }));
+        });
         break;
       case "planning":
-        setCurrentPhase("planning");
-        setStatus(t("deepThink.status.planning"));
+        update(taskId, {
+          currentPhase: "planning",
+          statusText: t("deepThink.status.planning"),
+        });
         break;
       case "thinking":
-        setCurrentIteration(event.data.iteration);
-        setCurrentPhase(event.data.phase);
-        setStatus(
-          t("deepThink.status.thinking", {
+        update(taskId, {
+          currentIteration: event.data.iteration,
+          currentPhase: event.data.phase,
+          statusText: t("deepThink.status.thinking", {
             iteration: event.data.iteration,
             phase: event.data.phase,
-          })
-        );
+          }),
+        });
         break;
       case "solution":
-        setCurrentSolution(event.data.solution);
-        setStatus(
-          t("deepThink.status.generatedSolution", {
+        update(taskId, {
+          currentSolution: event.data.solution,
+          statusText: t("deepThink.status.generatedSolution", {
             iteration: event.data.iteration,
-          })
-        );
+          }),
+        });
         break;
       case "verification":
-        setStatus(
-          t("deepThink.status.verification", {
-            result: event.data.passed ? t("deepThink.verification.passed") : t("deepThink.verification.failed"),
-          })
-        );
+        update(taskId, {
+          statusText: t("deepThink.status.verification", {
+            result: event.data.passed
+              ? t("deepThink.verification.passed")
+              : t("deepThink.verification.failed"),
+          }),
+        });
         break;
       case "correction":
-        setCurrentIteration(event.data.iteration);
-        setCurrentPhase("correcting");
-        setStatus(
-          t("deepThink.status.correcting", {
+        update(taskId, {
+          currentIteration: event.data.iteration,
+          currentPhase: "correcting",
+          statusText: t("deepThink.status.correcting", {
             iteration: event.data.iteration,
-          })
-        );
+          }),
+        });
         break;
       case "summarizing":
-        setCurrentPhase("summarizing");
-        setStatus(t("deepThink.status.summarizing"));
+        update(taskId, {
+          currentPhase: "summarizing",
+          statusText: t("deepThink.status.summarizing"),
+        });
         break;
       case "success":
-        setStatus(t("deepThink.status.success"));
-        toast.success(t("deepThink.status.success"));
+        update(taskId, { statusText: t("deepThink.status.success") });
+        if (isActiveTask(taskId)) toast.success(t("deepThink.status.success"));
         break;
       case "failure":
-        setStatus(t("deepThink.status.failure"));
-        toast.error(t("deepThink.status.failure"));
+        update(taskId, { statusText: t("deepThink.status.failure") });
+        if (isActiveTask(taskId)) toast.error(t("deepThink.status.failure"));
         break;
       case "progress":
-        setStatus(event.data.message);
+        update(taskId, { statusText: event.data.message });
         break;
+      case "snapshot": {
+        // 增量合并 —— 引擎分阶段上报，各次只带自己那部分字段
+        const prev = useThinkTaskStore.getState().get(taskId)?.snapshot ?? {};
+        update(taskId, { snapshot: { ...prev, ...event.data } });
+        break;
+      }
     }
   }
 
   /** 兜底：引擎启动前先搜一波资料，注入 knowledgeContext */
   async function runPreSearchFallback(
+    taskId: string,
     problemStatement: string,
     searchModel: string,
     userAnswers?: string,
+    abortSignal?: AbortSignal
   ): Promise<{ sources: Source[]; context: string }> {
-    handleProgress({ type: "progress", data: { message: "Pre-search: 分析问题，搜索外部资料..." } });
+    handleProgress(taskId, {
+      type: "progress",
+      data: { message: "Pre-search: 分析问题，搜索外部资料..." },
+    });
     try {
       const modelProvider = await createModelProvider(searchModel);
       const result = await runPreSearchPhase(problemStatement, modelProvider, search, {
         userAnswers,
         maxRounds: 2,
-        onProgress: (msg) => handleProgress({ type: "progress", data: { message: msg } }),
+        abortSignal,
+        onProgress: (msg) =>
+          handleProgress(taskId, { type: "progress", data: { message: msg } }),
       });
       if (result.allSources.length > 0) {
-        handleProgress({ type: "progress", data: { message: `Pre-search: 完成 — ${result.allSources.length} 条结果` } });
+        handleProgress(taskId, {
+          type: "progress",
+          data: { message: `Pre-search: 完成 — ${result.allSources.length} 条结果` },
+        });
       }
       return { sources: result.allSources, context: result.formattedContext };
     } catch (err) {
+      if (isAbortError(err)) throw err;
       console.warn("Pre-search failed, continuing:", err);
       return { sources: [], context: "" };
     }
   }
 
   async function runDeepThinkMode(
+    taskId: string,
     problemStatement: string,
     otherPrompts: string[] = [],
-    knowledgeContext?: string
-  ): Promise<DeepThinkResult | null> {
-    try {
-      const { model } = getModel();
-      const {
-        enableSearch,
-        searchProvider,
-        searchMaxResult,
-        enableModelStages,
-        modelStageInitial,
-        modelStageImprovement,
-        modelStageVerification,
-        modelStageCorrection,
-        modelStageSummary,
-        modelStageSearch,
-        enableAskQuestions,
-        enablePlanning,
-      } = useSettingStore.getState();
+    knowledgeContext?: string,
+    abortSignal?: AbortSignal,
+    resumeFrom?: ThinkTaskSnapshot
+  ): Promise<DeepThinkResult> {
+    const { model } = getModel();
+    const {
+      enableSearch,
+      searchProvider,
+      searchMaxResult,
+      enableModelStages,
+      modelStageInitial,
+      modelStageImprovement,
+      modelStageVerification,
+      modelStageCorrection,
+      modelStageSummary,
+      modelStageSearch,
+      enableAskQuestions,
+      enablePlanning,
+    } = useSettingStore.getState();
 
-      const enableWebSearch = enableSearch === "1" &&
-        (searchProvider === "model" ? isNetworkingModel(model) : true);
-      const useExternalSearch = enableWebSearch && searchProvider !== "model";
-      const searchFn = useExternalSearch ? (q: string) => search(q) : undefined;
+    const enableWebSearch = enableSearch === "1" &&
+      (searchProvider === "model" ? isNetworkingModel(model) : true);
+    const useExternalSearch = enableWebSearch && searchProvider !== "model";
+    const searchFn = useExternalSearch ? (q: string) => search(q) : undefined;
 
-      const modelStages = enableModelStages === "enable" ? {
-        initial: modelStageInitial || undefined,
-        improvement: modelStageImprovement || undefined,
-        verification: modelStageVerification || undefined,
-        correction: modelStageCorrection || undefined,
-        summary: modelStageSummary || undefined,
-        search: modelStageSearch || undefined,
-      } : undefined;
+    const modelStages = enableModelStages === "enable" ? {
+      initial: modelStageInitial || undefined,
+      improvement: modelStageImprovement || undefined,
+      verification: modelStageVerification || undefined,
+      correction: modelStageCorrection || undefined,
+      summary: modelStageSummary || undefined,
+      search: modelStageSearch || undefined,
+    } : undefined;
 
-      // 兜底：引擎启动前搜索。结果注入 knowledgeContext，让 DT 模型在 prompt 里直接引用
-      let preSearchSources: Source[] = [];
-      if (useExternalSearch) {
-        const pre = await runPreSearchFallback(
-          problemStatement,
-          modelStages?.search || model,
-        );
-        preSearchSources = pre.sources;
-        if (pre.context) {
-          knowledgeContext = knowledgeContext
-            ? `${pre.context}\n\n${knowledgeContext}`
-            : pre.context;
-        }
-      }
-
-      const result = await runDeepThink({
+    // 兜底：引擎启动前搜索。结果注入 knowledgeContext，让 DT 模型在 prompt 里直接引用
+    // 续跑时跳过 —— 上次搜到的资料已在快照的 sources 里
+    let preSearchSources: Source[] = resumeFrom?.sources ?? [];
+    if (useExternalSearch && !resumeFrom) {
+      const pre = await runPreSearchFallback(
+        taskId,
         problemStatement,
-        otherPrompts,
-        knowledgeContext,
-        enableWebSearch,
-        searchProvider: enableWebSearch
-          ? { provider: searchProvider, maxResult: searchMaxResult }
-          : undefined,
-        searchFn,
-        enableAskQuestions: enableAskQuestions === "enable",
-        enablePlanning: enablePlanning === "enable",
-        createModelProvider,
-        thinkingModel: model,
-        modelStages,
-        onProgress: handleProgress,
-      });
-
-      if (result && preSearchSources.length > 0) {
-        result.sources = mergeSources(preSearchSources, result.sources);
-        result.knowledgeEnhanced = true;
+        modelStages?.search || model,
+        undefined,
+        abortSignal
+      );
+      preSearchSources = pre.sources;
+      if (pre.context) {
+        knowledgeContext = knowledgeContext
+          ? `${pre.context}\n\n${knowledgeContext}`
+          : pre.context;
       }
-      return result;
-    } catch (err) {
-      handleError(err);
-      return null;
     }
+
+    const result = await runDeepThink({
+      problemStatement,
+      otherPrompts,
+      knowledgeContext,
+      enableWebSearch,
+      searchProvider: enableWebSearch
+        ? { provider: searchProvider, maxResult: searchMaxResult }
+        : undefined,
+      searchFn,
+      enableAskQuestions: enableAskQuestions === "enable",
+      enablePlanning: enablePlanning === "enable",
+      createModelProvider,
+      thinkingModel: model,
+      modelStages,
+      abortSignal,
+      resumeFrom,
+      // 续跑交互式任务时带回用户当初的回答，避免重新提问
+      userAnswers: resumeFrom?.userAnswers,
+      onProgress: (event) => handleProgress(taskId, event),
+    });
+
+    if (result && preSearchSources.length > 0) {
+      result.sources = mergeSources(preSearchSources, result.sources);
+      result.knowledgeEnhanced = true;
+    }
+    return result;
   }
 
   async function runUltraThinkMode(
+    taskId: string,
     problemStatement: string,
     numAgents?: number,
     otherPrompts: string[] = [],
-    knowledgeContext?: string
-  ): Promise<UltraThinkResult | null> {
-    try {
-      const { model } = getModel();
-      const { setAgentResults, updateAgentResult } = useGlobalStore.getState();
-      const {
-        enableSearch,
-        searchProvider,
-        searchMaxResult,
-        enableModelStages,
-        modelStageInitial,
-        modelStageImprovement,
-        modelStageVerification,
-        modelStageCorrection,
-        modelStageSummary,
-        modelStagePlanning,
-        modelStageAgentConfig,
-        modelStageAgentThinking,
-        modelStageSynthesis,
-        modelStageSearch,
-        enableAskQuestions,
-        enablePlanning,
-      } = useSettingStore.getState();
+    knowledgeContext?: string,
+    abortSignal?: AbortSignal,
+    resumeFrom?: ThinkTaskSnapshot
+  ): Promise<UltraThinkResult> {
+    const { model } = getModel();
+    const { update, updateAgentResult } = useThinkTaskStore.getState();
+    const {
+      enableSearch,
+      searchProvider,
+      searchMaxResult,
+      enableModelStages,
+      modelStageInitial,
+      modelStageImprovement,
+      modelStageVerification,
+      modelStageCorrection,
+      modelStageSummary,
+      modelStagePlanning,
+      modelStageAgentConfig,
+      modelStageAgentThinking,
+      modelStageSynthesis,
+      modelStageSearch,
+      enableAskQuestions,
+      enablePlanning,
+    } = useSettingStore.getState();
 
-      const enableWebSearch = enableSearch === "1" &&
-        (searchProvider === "model" ? isNetworkingModel(model) : true);
-      const useExternalSearch = enableWebSearch && searchProvider !== "model";
-      const searchFn = useExternalSearch ? (q: string) => search(q) : undefined;
+    const enableWebSearch = enableSearch === "1" &&
+      (searchProvider === "model" ? isNetworkingModel(model) : true);
+    const useExternalSearch = enableWebSearch && searchProvider !== "model";
+    const searchFn = useExternalSearch ? (q: string) => search(q) : undefined;
 
-      const modelStages = enableModelStages === "enable" ? {
-        initial: modelStageInitial || undefined,
-        improvement: modelStageImprovement || undefined,
-        verification: modelStageVerification || undefined,
-        correction: modelStageCorrection || undefined,
-        summary: modelStageSummary || undefined,
-        planning: modelStagePlanning || undefined,
-        agentConfig: modelStageAgentConfig || undefined,
-        agentThinking: modelStageAgentThinking || undefined,
-        synthesis: modelStageSynthesis || undefined,
-        search: modelStageSearch || undefined,
-      } : undefined;
+    const modelStages = enableModelStages === "enable" ? {
+      initial: modelStageInitial || undefined,
+      improvement: modelStageImprovement || undefined,
+      verification: modelStageVerification || undefined,
+      correction: modelStageCorrection || undefined,
+      summary: modelStageSummary || undefined,
+      planning: modelStagePlanning || undefined,
+      agentConfig: modelStageAgentConfig || undefined,
+      agentThinking: modelStageAgentThinking || undefined,
+      synthesis: modelStageSynthesis || undefined,
+      search: modelStageSearch || undefined,
+    } : undefined;
 
-      if (numAgents) {
-        const initialAgents: AgentResult[] = Array.from(
-          { length: numAgents },
-          (_, i) => ({
-            agentId: `agent_${String(i + 1).padStart(2, "0")}`,
-            approach: "准备中...",
-            specificPrompt: "",
-            status: "pending",
-            progress: 0,
-          })
-        );
-        setAgentResults(initialAgents);
-      } else {
-        setAgentResults([]);
-      }
-
-      let preSearchSources: Source[] = [];
-      if (useExternalSearch) {
-        const pre = await runPreSearchFallback(
-          problemStatement,
-          modelStages?.search || model,
-        );
-        preSearchSources = pre.sources;
-        if (pre.context) {
-          knowledgeContext = knowledgeContext
-            ? `${pre.context}\n\n${knowledgeContext}`
-            : pre.context;
-        }
-      }
-
-      const result = await runUltraThink({
-        problemStatement,
-        otherPrompts,
-        knowledgeContext,
-        enableWebSearch,
-        searchProvider: enableWebSearch
-          ? { provider: searchProvider, maxResult: searchMaxResult }
-          : undefined,
-        searchFn,
-        enableAskQuestions: enableAskQuestions === "enable",
-        enablePlanning: enablePlanning === "enable",
-        numAgents,
-        createModelProvider,
-        thinkingModel: model,
-        modelStages,
-        onProgress: handleProgress,
-        onAgentUpdate: (agentId: string, update: Partial<AgentResult>) => {
-          updateAgentResult(agentId, update);
-        },
-      });
-
-      if (result && preSearchSources.length > 0) {
-        result.sources = mergeSources(preSearchSources, result.sources);
-        result.knowledgeEnhanced = true;
-      }
-      return result;
-    } catch (err) {
-      handleError(err);
-      return null;
+    if (numAgents) {
+      const initialAgents: AgentResult[] = Array.from(
+        { length: numAgents },
+        (_, i) => ({
+          agentId: `agent_${String(i + 1).padStart(2, "0")}`,
+          approach: "准备中...",
+          specificPrompt: "",
+          status: "pending",
+          progress: 0,
+        })
+      );
+      update(taskId, { agentResults: initialAgents });
+    } else {
+      update(taskId, { agentResults: [] });
     }
+
+    // 续跑时跳过 —— 上次搜到的资料已在快照的 sources 里
+    let preSearchSources: Source[] = resumeFrom?.sources ?? [];
+    if (useExternalSearch && !resumeFrom) {
+      const pre = await runPreSearchFallback(
+        taskId,
+        problemStatement,
+        modelStages?.search || model,
+        undefined,
+        abortSignal
+      );
+      preSearchSources = pre.sources;
+      if (pre.context) {
+        knowledgeContext = knowledgeContext
+          ? `${pre.context}\n\n${knowledgeContext}`
+          : pre.context;
+      }
+    }
+
+    const result = await runUltraThink({
+      problemStatement,
+      otherPrompts,
+      knowledgeContext,
+      enableWebSearch,
+      searchProvider: enableWebSearch
+        ? { provider: searchProvider, maxResult: searchMaxResult }
+        : undefined,
+      searchFn,
+      enableAskQuestions: enableAskQuestions === "enable",
+      enablePlanning: enablePlanning === "enable",
+      numAgents,
+      createModelProvider,
+      thinkingModel: model,
+      modelStages,
+      abortSignal,
+      resumeFrom,
+      userAnswers: resumeFrom?.userAnswers,
+      onProgress: (event) => handleProgress(taskId, event),
+      onAgentUpdate: (agentId: string, agentUpdate: Partial<AgentResult>) => {
+        updateAgentResult(taskId, agentId, agentUpdate);
+      },
+    });
+
+    if (result && preSearchSources.length > 0) {
+      result.sources = mergeSources(preSearchSources, result.sources);
+      result.knowledgeEnhanced = true;
+    }
+    return result;
   }
 
+  /**
+   * 交互式 Deep Think 第一步：只生成澄清问题，然后停下等用户回答。
+   * 引擎实例存入 interactiveSessions，由 continueWithAnswers 接手。
+   */
   async function startInteractiveDeepThink(
+    taskId: string,
     problemStatement: string,
     otherPrompts: string[] = [],
-    knowledgeContext?: string
-  ): Promise<{ questions?: string } | null> {
-    try {
-      const { model } = getModel();
-      const {
-        enableSearch,
-        searchProvider,
-        searchMaxResult,
-        enableModelStages,
-        modelStageInitial,
-        modelStageImprovement,
-        modelStageVerification,
-        modelStageCorrection,
-        modelStageSummary,
-        modelStageSearch,
-        enablePlanning,
-      } = useSettingStore.getState();
+    knowledgeContext?: string,
+    abortSignal?: AbortSignal
+  ): Promise<{ questions?: string }> {
+    const { model } = getModel();
+    const {
+      enableSearch,
+      searchProvider,
+      searchMaxResult,
+      enableModelStages,
+      modelStageInitial,
+      modelStageImprovement,
+      modelStageVerification,
+      modelStageCorrection,
+      modelStageSummary,
+      modelStageSearch,
+      enablePlanning,
+    } = useSettingStore.getState();
 
-      const enableWebSearch = enableSearch === "1" &&
-        (searchProvider === "model" ? isNetworkingModel(model) : true);
-      const useExternalSearch = enableWebSearch && searchProvider !== "model";
-      const searchFn = useExternalSearch ? (q: string) => search(q) : undefined;
+    const enableWebSearch = enableSearch === "1" &&
+      (searchProvider === "model" ? isNetworkingModel(model) : true);
+    const useExternalSearch = enableWebSearch && searchProvider !== "model";
+    const searchFn = useExternalSearch ? (q: string) => search(q) : undefined;
 
-      const modelStages = enableModelStages === "enable" ? {
-        initial: modelStageInitial || undefined,
-        improvement: modelStageImprovement || undefined,
-        verification: modelStageVerification || undefined,
-        correction: modelStageCorrection || undefined,
-        summary: modelStageSummary || undefined,
-        search: modelStageSearch || undefined,
-      } : undefined;
+    const modelStages = enableModelStages === "enable" ? {
+      initial: modelStageInitial || undefined,
+      improvement: modelStageImprovement || undefined,
+      verification: modelStageVerification || undefined,
+      correction: modelStageCorrection || undefined,
+      summary: modelStageSummary || undefined,
+      search: modelStageSearch || undefined,
+    } : undefined;
 
-      const options: DeepThinkOptions = {
-        problemStatement,
-        otherPrompts,
-        knowledgeContext,
-        enableWebSearch,
-        searchProvider: enableWebSearch
-          ? { provider: searchProvider, maxResult: searchMaxResult }
-          : undefined,
-        searchFn,
-        enableAskQuestions: true,
-        enableInteractiveMode: true,
-        enablePlanning: enablePlanning === "enable",
-        createModelProvider,
-        thinkingModel: model,
-        modelStages,
-        onProgress: handleProgress,
-      };
+    const options: DeepThinkOptions = {
+      problemStatement,
+      otherPrompts,
+      knowledgeContext,
+      enableWebSearch,
+      searchProvider: enableWebSearch
+        ? { provider: searchProvider, maxResult: searchMaxResult }
+        : undefined,
+      searchFn,
+      enableAskQuestions: true,
+      enableInteractiveMode: true,
+      enablePlanning: enablePlanning === "enable",
+      createModelProvider,
+      thinkingModel: model,
+      modelStages,
+      abortSignal,
+      onProgress: (event) => handleProgress(taskId, event),
+    };
 
-      setInteractiveState(prev => ({ ...prev, originalOptions: options }));
+    const engine = new DeepThinkEngine(options);
+    const questions = await engine.askQuestions(problemStatement, true);
+    interactiveSessions.set(taskId, { engine, options });
 
-      const engine = new DeepThinkEngine(options);
-      const questions = await engine.askQuestions(problemStatement, true);
-      setInteractiveState(prev => ({ ...prev, engine }));
-
-      return { questions };
-    } catch (err) {
-      handleError(err);
-      return null;
-    }
+    return { questions };
   }
 
-  async function continueWithAnswers(userAnswers: string): Promise<any> {
-    if (!interactiveState.engine || !interactiveState.originalOptions) {
-      throw new Error("没有找到待继续的Deep Think会话");
+  /**
+   * 交互式 Deep Think 第二步：拿到用户回答后跑完整流程。
+   * 重新排队 —— 用户可能隔很久才回答，此时并发槽位应重新竞争。
+   */
+  function continueWithAnswers(taskId: string, userAnswers: string) {
+    const session = interactiveSessions.get(taskId);
+    if (!session) {
+      toast.error("没有找到待继续的 Deep Think 会话");
+      return;
     }
 
-    try {
-      setInteractiveState(prev => ({
-        ...prev,
-        isWaitingForAnswers: false,
-        questions: undefined,
-      }));
-
-      let knowledgeContext = interactiveState.originalOptions.knowledgeContext;
-      const searchFn = interactiveState.originalOptions.searchFn;
-      const problem = interactiveState.originalOptions.problemStatement;
-
-      let preSearchSources: Source[] = [];
-      if (searchFn) {
-        const searchModel =
-          interactiveState.originalOptions.modelStages?.search ||
-          interactiveState.originalOptions.thinkingModel;
-        const pre = await runPreSearchFallback(problem, searchModel, userAnswers);
-        preSearchSources = pre.sources;
-        if (pre.context) {
-          knowledgeContext = knowledgeContext
-            ? `${pre.context}\n\n${knowledgeContext}`
-            : pre.context;
-        }
-      }
-
-      const optionsWithAnswers: DeepThinkOptions = {
-        ...interactiveState.originalOptions,
-        knowledgeContext,
-        searchFn,
+    const { get, update } = useThinkTaskStore.getState();
+    const prevSnapshot = get(taskId)?.snapshot ?? {};
+    update(taskId, {
+      status: "queued",
+      isWaitingForAnswers: false,
+      questions: undefined,
+      statusText: "",
+      // 记进快照：万一后续失败，续跑时不必再问一遍
+      snapshot: {
+        ...prevSnapshot,
+        questions: prevSnapshot.questions ?? get(taskId)?.questions,
         userAnswers,
-        enableInteractiveMode: false,
-        onProgress: handleProgress,
-      };
+      },
+    });
 
-      const result = await runDeepThink(optionsWithAnswers);
+    void schedule(taskId, async (signal) => {
+      if (signal.aborted) return;
+      update(taskId, { status: "running", startedAt: Date.now() });
+      try {
+        let knowledgeContext = session.options.knowledgeContext;
+        const searchFn = session.options.searchFn;
+        const problem = session.options.problemStatement;
 
-      if (result && preSearchSources.length > 0) {
-        result.sources = mergeSources(preSearchSources, result.sources);
-        result.knowledgeEnhanced = true;
+        let preSearchSources: Source[] = [];
+        if (searchFn) {
+          const searchModel =
+            session.options.modelStages?.search || session.options.thinkingModel;
+          const pre = await runPreSearchFallback(
+            taskId,
+            problem,
+            searchModel,
+            userAnswers,
+            signal
+          );
+          preSearchSources = pre.sources;
+          if (pre.context) {
+            knowledgeContext = knowledgeContext
+              ? `${pre.context}\n\n${knowledgeContext}`
+              : pre.context;
+          }
+        }
+
+        const result = await runDeepThink({
+          ...session.options,
+          knowledgeContext,
+          userAnswers,
+          enableInteractiveMode: false,
+          abortSignal: signal,
+          onProgress: (event) => handleProgress(taskId, event),
+        });
+
+        if (result && preSearchSources.length > 0) {
+          result.sources = mergeSources(preSearchSources, result.sources);
+          result.knowledgeEnhanced = true;
+        }
+
+        finishTask(taskId, "deep-think", problem, result);
+      } catch (err) {
+        failTask(taskId, err);
+      } finally {
+        interactiveSessions.delete(taskId);
       }
+    });
+  }
 
-      setInteractiveState({ isWaitingForAnswers: false });
-      return result;
-    } catch (err) {
-      handleError(err);
-      return null;
+  /** 写入结果、存历史、标记完成 */
+  function finishTask(
+    taskId: string,
+    mode: ThinkMode,
+    question: string,
+    result: DeepThinkResult | UltraThinkResult
+  ) {
+    const { update } = useThinkTaskStore.getState();
+    const { saveThink } = useHistoryStore.getState();
+    const historyId = saveThink(mode, question, result);
+
+    update(taskId, {
+      status: "completed",
+      finishedAt: Date.now(),
+      historyId: historyId || undefined,
+      ...(mode === "deep-think"
+        ? { deepThinkResult: result as DeepThinkResult }
+        : { ultraThinkResult: result as UltraThinkResult }),
+    });
+  }
+
+  /** 区分「用户取消」和「真实失败」 */
+  function failTask(taskId: string, err: unknown) {
+    const { update } = useThinkTaskStore.getState();
+    if (isAbortError(err)) {
+      update(taskId, {
+        status: "cancelled",
+        finishedAt: Date.now(),
+        statusText: "",
+      });
+      return;
+    }
+    const message = handleError(taskId, err);
+    update(taskId, {
+      status: "failed",
+      finishedAt: Date.now(),
+      error: message,
+    });
+  }
+
+  /**
+   * 统一入口：建任务 → 排队 → 后台执行。
+   * 立即返回 taskId 而不等待完成 —— 这是「后台跑」的关键。
+   */
+  function startTask(input: CreateTaskInput): string {
+    const taskId = useThinkTaskStore.getState().create(input);
+    dispatchRun(taskId);
+    return taskId;
+  }
+
+  /**
+   * 排队执行某个任务。startTask 和 resumeTask 共用 ——
+   * 唯一差别是恢复时会带上 task.snapshot 交给引擎。
+   */
+  function dispatchRun(taskId: string) {
+    const { get, update } = useThinkTaskStore.getState();
+    const task = get(taskId);
+    if (!task) return;
+
+    const { enableAskQuestions } = useSettingStore.getState();
+    const snapshot = task.snapshot;
+    // 已经问过问题（快照里有）就不必再走交互流程
+    const interactive =
+      task.mode === "deep-think" &&
+      enableAskQuestions === "enable" &&
+      !snapshot?.questions;
+
+    void schedule(taskId, async (signal) => {
+      // 排队期间被取消：直接落终态，不要先闪一下 running
+      if (signal.aborted) return;
+      update(taskId, {
+        status: "running",
+        startedAt: Date.now(),
+        finishedAt: undefined,
+        error: undefined,
+      });
+      try {
+        if (interactive) {
+          // 生成问题后停下等用户回答；handleProgress 的 waiting_for_answers
+          // 分支会把状态置为 waiting
+          await startInteractiveDeepThink(
+            taskId,
+            task.question,
+            [],
+            task.knowledgeContext,
+            signal
+          );
+          return;
+        }
+
+        if (task.mode === "deep-think") {
+          const result = await runDeepThinkMode(
+            taskId,
+            task.question,
+            [],
+            task.knowledgeContext,
+            signal,
+            snapshot
+          );
+          finishTask(taskId, "deep-think", task.question, result);
+        } else {
+          const result = await runUltraThinkMode(
+            taskId,
+            task.question,
+            task.numAgents,
+            [],
+            task.knowledgeContext,
+            signal,
+            snapshot
+          );
+          finishTask(taskId, "ultra-think", task.question, result);
+        }
+      } catch (err) {
+        failTask(taskId, err);
+      }
+    });
+  }
+
+  /**
+   * 断点续跑：从失败/取消处继续。
+   * 有快照则跳过已完成阶段（DT 从中断轮次接着跑，UT 只重跑未完成的 agent）；
+   * 无快照则等价于从头重试。
+   */
+  function resumeTask(taskId: string) {
+    const task = useThinkTaskStore.getState().get(taskId);
+    if (!task) return;
+    if (task.status === "running" || task.status === "queued") return;
+
+    useThinkTaskStore.getState().update(taskId, {
+      status: "queued",
+      statusText: "",
+      error: undefined,
+    });
+    dispatchRun(taskId);
+  }
+
+  /** 取消任务：中断在途请求，并清理交互会话 */
+  function cancelTask(taskId: string) {
+    cancel(taskId);
+    interactiveSessions.delete(taskId);
+    const { get, update } = useThinkTaskStore.getState();
+    const task = get(taskId);
+    // 排队中/等待回答的任务不在 schedule 的 try 内，不会走到 catch，这里直接落终态
+    if (task && (task.status === "queued" || task.status === "waiting")) {
+      update(taskId, {
+        status: "cancelled",
+        finishedAt: Date.now(),
+        isWaitingForAnswers: false,
+        statusText: "",
+      });
     }
   }
 
-  function resetInteractiveState() {
-    setInteractiveState({ isWaitingForAnswers: false });
+  /** 删除任务：先取消，再从列表移除 */
+  function removeTask(taskId: string) {
+    cancel(taskId);
+    interactiveSessions.delete(taskId);
+    useThinkTaskStore.getState().remove(taskId);
   }
 
   return {
-    status,
-    runDeepThinkMode,
-    runUltraThinkMode,
-    interactiveState,
-    startInteractiveDeepThink,
+    startTask,
+    resumeTask,
     continueWithAnswers,
-    resetInteractiveState,
+    cancelTask,
+    removeTask,
   };
 }
 

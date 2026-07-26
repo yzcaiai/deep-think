@@ -1,4 +1,5 @@
 import { generateText } from "ai";
+import { isAbortError, throwIfAborted } from "./registry";
 
 // ===== Types =====
 
@@ -66,7 +67,8 @@ function formatSourcesForEvaluation(rounds: SearchRound[]): string {
 export async function generateSearchPlan(
   problemStatement: string,
   model: any,
-  userAnswers?: string
+  userAnswers?: string,
+  abortSignal?: AbortSignal
 ): Promise<string[]> {
   let prompt = `你是一个研究助手。在深入分析以下问题之前，你需要先搜索互联网获取真实、最新的资料。
 
@@ -84,12 +86,13 @@ ${problemStatement}
 {"searchQueries": ["query1", "query2", "query3"]}`;
 
   try {
-    const result = await generateText({ model, prompt });
+    const result = await generateText({ model, prompt, abortSignal });
     const parsed = tryExtractJson(result.text);
     if (parsed?.searchQueries && Array.isArray(parsed.searchQueries)) {
       return parsed.searchQueries.slice(0, 5).filter(Boolean);
     }
-  } catch {
+  } catch (err) {
+    if (isAbortError(err)) throw err;
     // fallthrough
   }
   // Fallback: use problemStatement as the only query
@@ -105,12 +108,14 @@ export async function executeSearchRound(
     sources: Source[];
     images: ImageSource[];
   }>,
-  onProgress?: (msg: string) => void
+  onProgress?: (msg: string) => void,
+  abortSignal?: AbortSignal
 ): Promise<SearchRound> {
   const allSources: Source[] = [];
   const seenUrls = new Set<string>();
 
   for (const query of queries) {
+    throwIfAborted(abortSignal);
     onProgress?.(`搜索: ${query}`);
     try {
       const { sources } = await searchFn(query);
@@ -121,6 +126,7 @@ export async function executeSearchRound(
         }
       }
     } catch (err) {
+      if (isAbortError(err)) throw err;
       console.warn(`Search failed for "${query}":`, err);
     }
   }
@@ -135,7 +141,8 @@ export async function executeSearchRound(
 export async function evaluateSearchResults(
   problemStatement: string,
   rounds: SearchRound[],
-  model: any
+  model: any,
+  abortSignal?: AbortSignal
 ): Promise<{
   needMoreSearch: boolean;
   followUpQueries: string[];
@@ -162,7 +169,7 @@ ${allResults}
 {"needMoreSearch": true/false, "followUpQueries": ["query1", "query2"], "gaps": "信息缺口描述"}`;
 
   try {
-    const result = await generateText({ model, prompt });
+    const result = await generateText({ model, prompt, abortSignal });
     const parsed = tryExtractJson(result.text);
     if (parsed) {
       return {
@@ -171,7 +178,8 @@ ${allResults}
         gaps: typeof parsed.gaps === "string" ? parsed.gaps : undefined,
       };
     }
-  } catch {
+  } catch (err) {
+    if (isAbortError(err)) throw err;
     // fallthrough
   }
   return { needMoreSearch: false, followUpQueries: [] };
@@ -194,19 +202,23 @@ export async function runPreSearchPhase(
     userAnswers?: string;
     maxRounds?: number;
     onProgress?: (msg: string) => void;
+    abortSignal?: AbortSignal;
   }
 ): Promise<PreSearchResult> {
   const maxRounds = options?.maxRounds ?? 3;
+  const abortSignal = options?.abortSignal;
   const rounds: SearchRound[] = [];
   const allSources: Source[] = [];
   const seenUrls = new Set<string>();
 
   // Round 1: Model generates search plan
+  throwIfAborted(abortSignal);
   options?.onProgress?.("Pre-search: 分析问题，生成搜索计划...");
   const initialQueries = await generateSearchPlan(
     problemStatement,
     model,
-    options?.userAnswers
+    options?.userAnswers,
+    abortSignal
   );
 
   if (!initialQueries || initialQueries.length === 0) {
@@ -220,7 +232,8 @@ export async function runPreSearchPhase(
   const round1 = await executeSearchRound(
     initialQueries,
     searchFn,
-    (msg) => options?.onProgress?.(`Pre-search: ${msg}`)
+    (msg) => options?.onProgress?.(`Pre-search: ${msg}`),
+    abortSignal
   );
   rounds.push(round1);
   for (const s of round1.sources) {
@@ -240,10 +253,12 @@ export async function runPreSearchPhase(
 
   // Additional rounds: Model evaluates and decides if more search needed
   for (let r = 1; r < maxRounds; r++) {
+    throwIfAborted(abortSignal);
     const evaluation = await evaluateSearchResults(
       problemStatement,
       rounds,
-      model
+      model,
+      abortSignal
     );
 
     if (!evaluation.needMoreSearch || evaluation.followUpQueries.length === 0) {
@@ -258,7 +273,8 @@ export async function runPreSearchPhase(
     const round = await executeSearchRound(
       evaluation.followUpQueries,
       searchFn,
-      (msg) => options?.onProgress?.(`Pre-search: ${msg}`)
+      (msg) => options?.onProgress?.(`Pre-search: ${msg}`),
+      abortSignal
     );
     rounds.push(round);
     for (const s of round.sources) {

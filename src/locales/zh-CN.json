@@ -339,6 +339,14 @@
     "config": {
       "numAgents": "Agent 数量",
       "numAgentsTip": "Ultra Think 模式下并行运行的 Agent 数量 (3-10)"
+    },
+    "task": {
+      "newTask": "新任务",
+      "cancel": "取消任务",
+      "remove": "移除任务",
+      "retry": "从头重试",
+      "resumeIteration": "从第 {{iteration}} 轮继续",
+      "resumeAgents": "继续（复用 {{count}} 个已完成 Agent）"
     }
   },
   "setting": {

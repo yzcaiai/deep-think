@@ -185,6 +185,7 @@ const formSchema = z.object({
   modelStageSearch: z.string().optional(),
   enableAskQuestions: z.enum(["enable", "disable"]).optional(),
   enablePlanning: z.enum(["enable", "disable"]).optional(),
+  maxConcurrentTasks: z.number().min(1).max(5),
 });
 
 function convertModelName(name: string) {
@@ -2343,6 +2344,36 @@ function Setting({ open, onClose }: SettingProps) {
                                 <SelectItem value="disable">禁用</SelectItem>
                               </SelectContent>
                             </Select>
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name="maxConcurrentTasks"
+                      render={({ field }) => (
+                        <FormItem className="from-item">
+                          <FormLabel className="from-label">
+                            <HelpTip tip="同时在后台运行的思考任务上限，超出的任务会排队等待。注意 Ultra Think 内部还会派生多个子 Agent，实际并发的模型请求数是本设置的数倍，调高易触发 API 速率限制。">
+                              并行任务数
+                            </HelpTip>
+                          </FormLabel>
+                          <FormControl className="form-field">
+                            <div className="flex h-9">
+                              <Slider
+                                className="flex-1"
+                                value={[field.value]}
+                                max={5}
+                                min={1}
+                                step={1}
+                                onValueChange={(values) =>
+                                  field.onChange(values[0])
+                                }
+                              />
+                              <span className="w-[14%] text-center text-sm leading-10">
+                                {field.value}
+                              </span>
+                            </div>
                           </FormControl>
                         </FormItem>
                       )}

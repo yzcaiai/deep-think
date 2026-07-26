@@ -339,6 +339,14 @@
     "config": {
       "numAgents": "Number of Agents",
       "numAgentsTip": "Number of agents running in parallel in Ultra Think mode (3-10)"
+    },
+    "task": {
+      "newTask": "New task",
+      "cancel": "Cancel task",
+      "remove": "Remove task",
+      "retry": "Retry from start",
+      "resumeIteration": "Resume from iteration {{iteration}}",
+      "resumeAgents": "Resume (reuse {{count}} completed agents)"
     }
   },
   "setting": {

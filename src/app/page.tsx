@@ -1,16 +1,19 @@
 "use client";
 import dynamic from "next/dynamic";
-import { useLayoutEffect } from "react";
+import { useEffect, useLayoutEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useTheme } from "next-themes";
 import { useGlobalStore } from "@/store/global";
 import { useSettingStore } from "@/store/setting";
+import { useActiveTask, hasPendingTasks } from "@/store/thinkTask";
+import { setConcurrency } from "@/utils/deep-think/registry";
 
 const Header = dynamic(() => import("@/components/Internal/Header"));
 const Setting = dynamic(() => import("@/components/Setting"));
 const Topic = dynamic(() => import("@/components/Research/Topic"));
 const History = dynamic(() => import("@/components/History"));
 const Knowledge = dynamic(() => import("@/components/Knowledge"));
+const TaskBar = dynamic(() => import("@/components/DeepThink/TaskBar"));
 const ThinkingProcess = dynamic(
   () => import("@/components/DeepThink/ThinkingProcess")
 );
@@ -39,31 +42,42 @@ function Home() {
     setOpenHistory,
     openKnowledge,
     setOpenKnowledge,
-    thinkMode,
-    deepThinkResult,
-    ultraThinkResult,
-    isThinking,
-    currentIteration,
-    currentPhase,
-    currentSolution,
-    agentResults,
   } = useGlobalStore();
 
-  const { theme } = useSettingStore();
+  const task = useActiveTask();
+  const isThinking = task?.status === "running";
+
+  const { theme, maxConcurrentTasks } = useSettingStore();
   const { setTheme } = useTheme();
 
   useLayoutEffect(() => {
     const settingStore = useSettingStore.getState();
     setTheme(settingStore.theme);
   }, [theme, setTheme]);
+
+  // 并发上限跟随设置
+  useEffect(() => {
+    setConcurrency(maxConcurrentTasks);
+  }, [maxConcurrentTasks]);
+
+  // 任务跑在浏览器里，刷新即丢失 —— 有未完成任务时拦一下
+  useEffect(() => {
+    const handler = (ev: BeforeUnloadEvent) => {
+      if (hasPendingTasks()) ev.preventDefault();
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, []);
+
   return (
     <div className="max-lg:max-w-screen-md max-w-screen-lg mx-auto px-4">
       <Header />
+      <TaskBar />
       <main>
         <Topic />
-        
+
         {/* Deep Think Mode - Show thinking process (only when actually thinking) */}
-        {thinkMode === "deep-think" && isThinking && !deepThinkResult && (
+        {task?.mode === "deep-think" && isThinking && !task.deepThinkResult && (
           <>
             <section className="p-4 border rounded-md mt-4">
               <ThinkingProcess
@@ -71,47 +85,47 @@ function Home() {
                   {
                     id: "thinking",
                     label: t("deepThink.status.thinking", {
-                      iteration: currentIteration,
-                      phase: currentPhase || "initializing",
+                      iteration: task.currentIteration,
+                      phase: task.currentPhase || "initializing",
                     }),
                     status: "running",
-                    detail: currentIteration > 0 ? `第 ${currentIteration} 轮 - ${currentPhase}` : undefined,
+                    detail: task.currentIteration > 0 ? `第 ${task.currentIteration} 轮 - ${task.currentPhase}` : undefined,
                   },
                 ]}
               />
             </section>
             {/* Show current solution if available */}
-            {currentSolution && (
+            {task.currentSolution && (
               <section className="p-4 border rounded-md mt-4">
                 <h3 className="font-semibold text-lg mb-3">
-                  {t("deepThink.results.currentSolution")} (第 {currentIteration} 轮)
+                  {t("deepThink.results.currentSolution")} (第 {task.currentIteration} 轮)
                 </h3>
                 <div className="prose dark:prose-invert max-w-none text-sm">
                   <pre className="whitespace-pre-wrap bg-gray-50 dark:bg-gray-900 p-3 rounded">
-                    {currentSolution}
+                    {task.currentSolution}
                   </pre>
                 </div>
               </section>
             )}
           </>
         )}
-        
+
         {/* Ultra Think Mode - Show agent progress (only when actually thinking) */}
-        {thinkMode === "ultra-think" && isThinking && !ultraThinkResult && (
+        {task?.mode === "ultra-think" && isThinking && !task.ultraThinkResult && (
           <section className="p-4 border rounded-md mt-4">
-            <AgentProgress agents={agentResults} />
+            <AgentProgress agents={task.agentResults} />
           </section>
         )}
 
         {/* Results Display */}
-        {thinkMode === "deep-think" && deepThinkResult && (
+        {task?.mode === "deep-think" && task.deepThinkResult && (
           <section className="p-4 border rounded-md mt-4">
-            <DeepThinkResults result={deepThinkResult} />
+            <DeepThinkResults result={task.deepThinkResult} />
           </section>
         )}
-        {thinkMode === "ultra-think" && ultraThinkResult && (
+        {task?.mode === "ultra-think" && task.ultraThinkResult && (
           <section className="p-4 border rounded-md mt-4">
-            <UltraThinkResults result={ultraThinkResult} />
+            <UltraThinkResults result={task.ultraThinkResult} />
           </section>
         )}
       </main>

@@ -97,6 +97,8 @@ export interface SettingStore {
   // DeepThink 询问和计划阶段
   enableAskQuestions: "enable" | "disable";
   enablePlanning: "enable" | "disable";
+  /** 同时运行的思考任务上限，超出的任务排队等待 */
+  maxConcurrentTasks: number;
 }
 
 interface SettingActions {
@@ -199,6 +201,7 @@ export const defaultValues: SettingStore = {
   modelStageSearch: "",
   enableAskQuestions: "disable",
   enablePlanning: "disable",
+  maxConcurrentTasks: 3,
 };
 
 export const useSettingStore = create(

@@ -32,6 +32,7 @@ import {
   type HistoryItem,
 } from "@/store/history";
 import { useGlobalStore } from "@/store/global";
+import { useThinkTaskStore } from "@/store/thinkTask";
 import { downloadFile } from "@/utils/file";
 import { fileParser } from "@/utils/parser";
 
@@ -95,12 +96,9 @@ function History({ open, onClose }: HistoryProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { backup, restore, reset } = useTaskStore();
   const { history, save, load, update, remove } = useHistoryStore();
-  const {
-    setThinkMode,
-    setDeepThinkResult,
-    setUltraThinkResult,
-    resetThinkResults,
-  } = useGlobalStore();
+  const { setThinkMode } = useGlobalStore();
+  const createThinkTask = useThinkTaskStore((state) => state.create);
+  const setActiveThinkTask = useThinkTaskStore((state) => state.setActive);
   const [historyList, setHistoryList] = useState<HistoryItem[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
   const showLoadMore = useMemo(() => {
@@ -126,28 +124,27 @@ function History({ open, onClose }: HistoryProps) {
 
     // 判断是哪种类型的历史记录
     if (isThinkHistory(data)) {
-      // Think 模式历史记录
-      // 先保存当前 Research 状态（如果有的话）
+      // Think 模式历史记录：落成一个已完成的任务，与实时任务走同一条渲染路径
       const { id: currentId, backup: backupTask } = useTaskStore.getState();
       if (currentId) {
         update(currentId, backupTask());
       }
-      
-      resetThinkResults();
+
       setThinkMode(data.mode);
-      const { setQuestion } = useTaskStore.getState();
-      setQuestion(data.question);
-      
-      if (data.mode === "deep-think") {
-        setDeepThinkResult(data.result as DeepThinkResult);
-      } else if (data.mode === "ultra-think") {
-        setUltraThinkResult(data.result as UltraThinkResult);
-      }
+      createThinkTask({
+        question: data.question,
+        mode: data.mode,
+        status: "completed",
+        historyId: data.id,
+        deepThinkResult:
+          data.mode === "deep-think" ? (data.result as DeepThinkResult) : null,
+        ultraThinkResult:
+          data.mode === "ultra-think" ? (data.result as UltraThinkResult) : null,
+      });
     } else {
       // Research 模式历史记录（ResearchHistory 扩展自 TaskStore）
-      // 先重置 Think 结果
-      resetThinkResults();
-      
+      setActiveThinkTask("");
+
       const { id: currentId } = useTaskStore.getState();
       update(currentId, backup());
       reset();

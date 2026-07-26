@@ -21,6 +21,7 @@ import {
   buildAskQuestionsPrompt,
   buildThinkingPlanPrompt,
 } from "./prompts";
+import { throwIfAborted } from "./registry";
 
 
 type ProviderOptions = Record<string, Record<string, JSONValue>>;
@@ -77,6 +78,10 @@ export interface DeepThinkOptions {
   taskModel?: string;
   /** 分阶段模型配置，未指定的阶段使用 thinkingModel */
   modelStages?: ModelStageConfig;
+  /** 中断信号：透传给所有 LLM 调用，并在主循环各检查点判断 */
+  abortSignal?: AbortSignal;
+  /** 断点续跑：从上次中断的快照恢复，跳过已完成的阶段 */
+  resumeFrom?: ThinkTaskSnapshot;
 }
 
 export type DeepThinkProgressEvent =
@@ -91,7 +96,9 @@ export type DeepThinkProgressEvent =
   | { type: "summarizing"; data: { message: string } }
   | { type: "success"; data: { solution: string; iterations: number } }
   | { type: "failure"; data: { reason: string } }
-  | { type: "progress"; data: { message: string } };
+  | { type: "progress"; data: { message: string } }
+  /** 阶段性快照：外层据此保存进度，失败后可从此处续跑 */
+  | { type: "snapshot"; data: Partial<ThinkTaskSnapshot> };
 
 export class DeepThinkEngine {
   private options: DeepThinkOptions;
@@ -111,6 +118,11 @@ export class DeepThinkEngine {
     if (this.options.onProgress) {
       this.options.onProgress(event);
     }
+  }
+
+  /** 中断检查点：在长循环的各阶段之间调用，避免取消后还跑完整轮 */
+  private checkAborted() {
+    throwIfAborted(this.options.abortSignal);
   }
 
   /**
@@ -259,6 +271,7 @@ export class DeepThinkEngine {
     const result = await generateText({
       model,
       prompt,
+      abortSignal: this.options.abortSignal,
     });
 
     const questions = result.text;
@@ -296,6 +309,7 @@ export class DeepThinkEngine {
     const result = await generateText({
       model,
       prompt,
+      abortSignal: this.options.abortSignal,
     });
 
     const plan = result.text;
@@ -328,6 +342,7 @@ export class DeepThinkEngine {
       model,
       system: verificationSystemPrompt,
       prompt: verificationPrompt,
+      abortSignal: this.options.abortSignal,
     });
 
     const verificationOutput = verificationResult.text;
@@ -338,6 +353,7 @@ export class DeepThinkEngine {
     const checkResult = await generateText({
       model,
       prompt: checkPrompt,
+      abortSignal: this.options.abortSignal,
     });
 
     const goodVerify = checkResult.text;
@@ -383,6 +399,7 @@ export class DeepThinkEngine {
       tools: await this.getSearchTools(),
       providerOptions: this.getProviderOptions(),
       maxSteps: 5,
+      abortSignal: this.options.abortSignal,
     });
 
     // 提取搜索来源
@@ -422,6 +439,7 @@ export class DeepThinkEngine {
       tools: await this.getSearchTools(),
       providerOptions: this.getProviderOptions(),
       maxSteps: 5,
+      abortSignal: this.options.abortSignal,
     });
 
     // 提取搜索来源
@@ -455,50 +473,89 @@ export class DeepThinkEngine {
     const maxIterations = this.options.maxIterations!;
     const requiredSuccesses = this.options.requiredSuccessfulVerifications!;
     const maxErrors = this.options.maxErrorsBeforeGiveUp!;
+    const resume = this.options.resumeFrom;
 
+    this.checkAborted();
     this.emit({ type: "init", data: { problem: problemStatement } });
 
-    let questions: string | undefined;
-    let plan: string | undefined;
+    // 恢复已有来源，避免续跑后引用丢失
+    if (resume?.sources?.length) {
+      this.sources.push(...resume.sources);
+    }
 
-    // Ask questions phase (optional)
-    if (this.options.enableAskQuestions) {
+    let questions: string | undefined = resume?.questions;
+    let plan: string | undefined = resume?.plan;
+
+    // Ask questions phase (optional) —— 已有则跳过
+    if (this.options.enableAskQuestions && !questions) {
       questions = await this.askQuestions(problemStatement, this.options.enableInteractiveMode);
       // Note: In interactive mode, the process may pause here for user input
       // The actual continuation will be handled by the calling code
     }
 
-    // Planning phase (optional)
-    if (this.options.enablePlanning) {
+    // Planning phase (optional) —— 已有则跳过
+    if (this.options.enablePlanning && !plan) {
       plan = await this.generateThinkingPlan(
         problemStatement,
         this.options.userAnswers
       );
-      // Add plan to otherPrompts for context
-      if (plan) {
-        otherPrompts.push(`\n### Thinking Plan ###\n${plan}\n`);
+    }
+    // 计划要注入上下文，无论是新生成的还是从快照恢复的
+    if (plan) {
+      otherPrompts.push(`\n### Thinking Plan ###\n${plan}\n`);
+    }
+    this.emit({ type: "snapshot", data: { questions, plan } });
+
+    let initialThought: string;
+    let solution: string;
+    let verification: { bugReport: string; goodVerify: string };
+    const iterations: DeepThinkIteration[] = resume?.iterations
+      ? [...resume.iterations]
+      : [];
+    const verifications: Verification[] = resume?.verifications
+      ? [...resume.verifications]
+      : [];
+    let correctCount: number;
+
+    if (resume?.solution) {
+      // 续跑：沿用上次的解，重新验证一次以拿到当前的 bugReport
+      initialThought = resume.initialThought ?? resume.solution;
+      solution = resume.solution;
+      this.emit({
+        type: "progress",
+        data: { message: "从上次中断处恢复，重新验证当前方案..." },
+      });
+      verification = await this.verifySolution(problemStatement, solution);
+      correctCount = resume.correctCount ?? 0;
+    } else {
+      // Initial exploration
+      const initial = await this.initialExploration(problemStatement, otherPrompts);
+      if (!initial) {
+        throw new Error("Failed in initial exploration");
       }
+      initialThought = initial.solution;
+      solution = initial.solution;
+      verification = initial.verification;
+      correctCount = verification.goodVerify.toLowerCase().includes("yes") ? 1 : 0;
     }
 
-    // Initial exploration
-    const initial = await this.initialExploration(problemStatement, otherPrompts);
-    if (!initial) {
-      throw new Error("Failed in initial exploration");
-    }
-
-    let solution = initial.solution;
-    let verification = initial.verification;
-
-    const iterations: DeepThinkIteration[] = [];
-    const verifications: Verification[] = [];
+    this.emit({
+      type: "snapshot",
+      data: {
+        initialThought,
+        solution,
+        sources: this.sources.length > 0 ? [...this.sources] : undefined,
+      },
+    });
 
     let errorCount = 0;
-    let correctCount = verification.goodVerify.toLowerCase().includes("yes")
-      ? 1
-      : 0;
+    const startIteration = resume?.completedIterations ?? 0;
 
     // Main loop
-    for (let i = 0; i < maxIterations; i++) {
+    for (let i = startIteration; i < maxIterations; i++) {
+      // 取消后立即退出，不再跑完当前这一轮（一轮可能好几分钟）
+      this.checkAborted();
+
       const passed = verification.goodVerify.toLowerCase().includes("yes");
 
       verifications.push({
@@ -555,6 +612,7 @@ export class DeepThinkEngine {
           tools: await this.getSearchTools(),
           providerOptions: this.getProviderOptions(),
           maxSteps: 5,
+          abortSignal: this.options.abortSignal,
         });
 
         // 提取搜索来源
@@ -569,6 +627,21 @@ export class DeepThinkEngine {
         correctCount++;
         errorCount = 0;
       }
+
+      // 快照必须落在修正/计数更新之后 —— 此时 solution 是最新一版、correctCount 已更新，
+      // 续跑时从 i+1 轮开始才不会重复或倒退
+      this.emit({
+        type: "snapshot",
+        data: {
+          initialThought,
+          solution,
+          iterations: [...iterations],
+          verifications: [...verifications],
+          completedIterations: i + 1,
+          correctCount,
+          sources: this.sources.length > 0 ? [...this.sources] : undefined,
+        },
+      });
 
       if (correctCount >= requiredSuccesses) {
         // Generate final summary for the user
@@ -588,6 +661,7 @@ export class DeepThinkEngine {
         const summaryResult = await generateText({
           model: summaryModelProvider,
           prompt: summaryPrompt,
+          abortSignal: this.options.abortSignal,
         });
 
         const finalSummary = summaryResult.text;
@@ -602,7 +676,7 @@ export class DeepThinkEngine {
           questions,
           userAnswers: this.options.userAnswers,
           plan,
-          initialThought: initial.solution,
+          initialThought,
           improvements: [],
           iterations,
           verifications,
@@ -643,6 +717,7 @@ export class DeepThinkEngine {
     const summaryResult = await generateText({
       model: summaryModelProvider,
       prompt: summaryPrompt,
+      abortSignal: this.options.abortSignal,
     });
 
     const finalSummary = summaryResult.text;
@@ -657,7 +732,7 @@ export class DeepThinkEngine {
       questions,
       userAnswers: this.options.userAnswers,
       plan,
-      initialThought: initial.solution,
+      initialThought,
       improvements: [],
       iterations,
       verifications,
@@ -697,6 +772,11 @@ export class UltraThinkEngine {
     if (this.options.onProgress) {
       this.options.onProgress(event);
     }
+  }
+
+  /** 中断检查点：在长循环的各阶段之间调用，避免取消后还跑完整轮 */
+  private checkAborted() {
+    throwIfAborted(this.options.abortSignal);
   }
 
   /**
@@ -790,6 +870,7 @@ export class UltraThinkEngine {
     const result = await generateText({
       model,
       prompt: ultraThinkPlanPrompt.replace("{query}", problemStatement),
+      abortSignal: this.options.abortSignal,
     });
 
     return result.text;
@@ -824,6 +905,7 @@ export class UltraThinkEngine {
         schema: agentConfigSchema,
         mode: "json", // Use JSON mode for broader model compatibility
         prompt: generateAgentPromptsPrompt.replace("{plan}", plan),
+        abortSignal: this.options.abortSignal,
       });
 
       return result.object.configs;
@@ -834,6 +916,7 @@ export class UltraThinkEngine {
       const textResult = await generateText({
         model,
         prompt: generateAgentPromptsPrompt.replace("{plan}", plan),
+        abortSignal: this.options.abortSignal,
       });
 
       // Try to parse the JSON, with better error handling
@@ -958,13 +1041,20 @@ export class UltraThinkEngine {
 
   async run(): Promise<UltraThinkResult> {
     const { problemStatement, onAgentUpdate } = this.options;
+    const resume = this.options.resumeFrom;
 
+    this.checkAborted();
     this.emit({ type: "init", data: { problem: problemStatement } });
 
-    let questions: string | undefined;
+    // 恢复已有来源，避免续跑后引用丢失
+    if (resume?.sources?.length) {
+      this.sources.push(...resume.sources);
+    }
 
-    // Ask questions phase (optional)
-    if (this.options.enableAskQuestions) {
+    let questions: string | undefined = resume?.questions;
+
+    // Ask questions phase (optional) —— 已有则跳过
+    if (this.options.enableAskQuestions && !questions) {
       this.emit({
         type: "progress",
         data: { message: "Generating clarification questions..." },
@@ -976,6 +1066,7 @@ export class UltraThinkEngine {
       const result = await generateText({
         model,
         prompt,
+        abortSignal: this.options.abortSignal,
       });
 
       questions = result.text;
@@ -985,27 +1076,44 @@ export class UltraThinkEngine {
       });
     }
 
-    // Generate plan (with user answers if provided)
-    const plan = await this.generatePlan(
-      this.options.userAnswers
-        ? `${problemStatement}\n\n### User Provided Context ###\n${this.options.userAnswers}`
-        : problemStatement
-    );
+    // Generate plan (with user answers if provided) —— 快照里有则复用
+    const plan =
+      resume?.plan ??
+      (await this.generatePlan(
+        this.options.userAnswers
+          ? `${problemStatement}\n\n### User Provided Context ###\n${this.options.userAnswers}`
+          : problemStatement
+      ));
 
-    // Generate agent configs
-    const configs = await this.generateAgentConfigs(plan);
-    
+    // Generate agent configs —— 快照里有则复用，保证续跑时 agent 划分不变
+    const configs =
+      resume?.agentConfigs?.length
+        ? resume.agentConfigs
+        : await this.generateAgentConfigs(plan);
+
     // Use all agents suggested by LLM, unless numAgents is explicitly set as a limit
-    const selectedConfigs = this.options.numAgents 
+    const selectedConfigs = this.options.numAgents
       ? configs.slice(0, this.options.numAgents)
       : configs;
-    
+
     const numAgents = selectedConfigs.length;
+
+    this.emit({
+      type: "snapshot",
+      data: { questions, plan, agentConfigs: selectedConfigs },
+    });
+
+    // 已跑完的 agent 直接复用，不重跑
+    const doneById = new Map<string, AgentResult>();
+    for (const done of resume?.completedAgents ?? []) {
+      if (done.status === "completed") doneById.set(done.agentId, done);
+    }
 
     // Update agent configs in UI
     if (onAgentUpdate) {
       selectedConfigs.forEach((config) => {
-        onAgentUpdate(config.agentId, {
+        const done = doneById.get(config.agentId);
+        onAgentUpdate(config.agentId, done ?? {
           approach: config.approach,
           specificPrompt: config.specificPrompt,
         });
@@ -1013,16 +1121,37 @@ export class UltraThinkEngine {
     }
 
     // Run agents in parallel
+    this.checkAborted();
+    const pending = selectedConfigs.filter((c) => !doneById.has(c.agentId));
     this.emit({
       type: "progress",
-      data: { message: `Running ${numAgents} agents in parallel...` },
+      data: {
+        message: doneById.size > 0
+          ? `复用 ${doneById.size} 个已完成 agent，重跑 ${pending.length} 个...`
+          : `Running ${numAgents} agents in parallel...`,
+      },
     });
 
     const agentResults = await Promise.all(
-      selectedConfigs.map((config) =>
-        this.runAgent(config, problemStatement, onAgentUpdate)
-      )
+      selectedConfigs.map((config) => {
+        const done = doneById.get(config.agentId);
+        // 已完成的直接返回快照结果，不发起任何请求
+        if (done) return Promise.resolve(done);
+        return this.runAgent(config, problemStatement, onAgentUpdate);
+      })
     );
+
+    // 子 agent 内部会吞掉自身异常（记为 failed），所以取消后要在这里显式退出
+    this.checkAborted();
+
+    // 合成前上报快照 —— 若合成阶段失败，续跑时不必重跑所有 agent
+    this.emit({
+      type: "snapshot",
+      data: {
+        completedAgents: agentResults.filter((r) => r.status === "completed"),
+        sources: this.sources.length > 0 ? [...this.sources] : undefined,
+      },
+    });
 
     // Synthesize results
     this.emit({
@@ -1053,6 +1182,7 @@ ${result.solution || "No solution generated"}
       prompt: synthesizeResultsPrompt
         .replace("{problem}", problemStatement)
         .replace("{agentResults}", agentResultsText),
+      abortSignal: this.options.abortSignal,
     });
 
     const synthesis = synthesisResult.text;
@@ -1074,6 +1204,7 @@ ${result.solution || "No solution generated"}
     const summaryResultFinal = await generateText({
       model: summaryModelProvider,
       prompt: summaryPrompt,
+      abortSignal: this.options.abortSignal,
     });
 
     const finalSummary = summaryResultFinal.text;

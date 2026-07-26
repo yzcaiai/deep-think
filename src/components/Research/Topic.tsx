@@ -12,7 +12,6 @@ import {
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { toast } from "sonner";
 import ResourceList from "@/components/Knowledge/ResourceList";
 import Crawler from "@/components/Knowledge/Crawler";
 import ModeSelector from "@/components/DeepThink/ModeSelector";
@@ -36,38 +35,45 @@ import {
 import useDeepThinkEngine from "@/hooks/useDeepThink";
 import useModelProvider from "@/hooks/useAiProvider";
 import useKnowledge from "@/hooks/useKnowledge";
-import useAccurateTimer from "@/hooks/useAccurateTimer";
 import { useGlobalStore } from "@/store/global";
 import { useSettingStore } from "@/store/setting";
 import { useTaskStore } from "@/store/task";
-import { useHistoryStore } from "@/store/history";
+import { useThinkTaskStore, useActiveTask } from "@/store/thinkTask";
 import { useKnowledgeStore } from "@/store/knowledge";
 
 const formSchema = z.object({
   topic: z.string().min(2),
 });
 
+/** 运行中任务的计时显示（1s 粒度即可，无需 requestAnimationFrame） */
+function useElapsed(startedAt?: number, live?: boolean) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!live) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [live]);
+  if (!startedAt || !live) return "";
+  const total = Math.floor((now - startedAt) / 1000);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return m > 0 ? `${m}m${String(s).padStart(2, "0")}s` : `${s}s`;
+}
+
 function Topic() {
   const { t } = useTranslation();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const taskStore = useTaskStore();
   const globalStore = useGlobalStore();
-  const { 
-    runDeepThinkMode, 
-    runUltraThinkMode,
-    interactiveState,
-    startInteractiveDeepThink,
-    continueWithAnswers,
-    resetInteractiveState
-  } = useDeepThinkEngine();
+  const { startTask, continueWithAnswers } = useDeepThinkEngine();
   const { hasApiKey } = useModelProvider();
   const { getKnowledgeFromFile } = useKnowledge();
-  const {
-    formattedTime,
-    start: accurateTimerStart,
-    stop: accurateTimerStop,
-  } = useAccurateTimer();
-  const [isThinking, setIsThinking] = useState<boolean>(false);
+
+  const activeTask = useActiveTask();
+  const activeTaskId = useThinkTaskStore((state) => state.activeTaskId);
+  const isThinking = activeTask?.status === "running";
+  const formattedTime = useElapsed(activeTask?.startedAt, isThinking);
+
   const [openCrawler, setOpenCrawler] = useState<boolean>(false);
   const [numAgents, setNumAgents] = useState<number>(0); // 0 = auto mode
   const [userAnswers, setUserAnswers] = useState<string>(""); // 用户回答
@@ -75,7 +81,7 @@ function Topic() {
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
     defaultValues: {
-      topic: taskStore.question,
+      topic: activeTask?.question ?? "",
     },
   });
 
@@ -120,123 +126,37 @@ function Topic() {
   }
 
   async function handleSubmit(values: z.infer<typeof formSchema>) {
-    if (handleCheck()) {
-      const { id, setQuestion } = useTaskStore.getState();
-      const {
-        thinkMode,
-        setDeepThinkResult,
-        setUltraThinkResult,
-        setIsThinking: setGlobalThinking,
-      } = useGlobalStore.getState();
-      const { enableAskQuestions } = useSettingStore.getState();
-      
-      try {
-        setIsThinking(true);
-        setGlobalThinking(true);
-        accurateTimerStart();
-        if (id !== "") {
-          createNewResearch();
-          form.setValue("topic", values.topic);
-        }
-        setQuestion(values.topic);
+    if (!handleCheck()) return;
 
-        // 收集知识库资源
-        const knowledgeContext = collectKnowledgeContext();
+    const { setQuestion } = useTaskStore.getState();
+    const { thinkMode } = useGlobalStore.getState();
 
-        // 检查是否启用问问题功能（仅对Deep Think模式）
-        if (thinkMode === "deep-think" && enableAskQuestions === "enable") {
-          // 使用交互式Deep Think流程
-          const result = await startInteractiveDeepThink(values.topic, [], knowledgeContext);
-          if (result && result.questions) {
-            // 问题已生成，暂停计时器等待用户回答
-            setIsThinking(false);
-            setGlobalThinking(false);
-            accurateTimerStop();
-          }
-          return; // 提前返回，等待用户回答
-        }
+    setQuestion(values.topic);
 
-        // 标准非交互流程
-        // Route to different modes
-        if (thinkMode === "deep-think") {
-          const result = await runDeepThinkMode(values.topic, [], knowledgeContext);
-          if (result) {
-            setDeepThinkResult(result);
-            // 保存到历史记录
-            const { saveThink } = useHistoryStore.getState();
-            saveThink("deep-think", values.topic, result);
-          }
-        } else if (thinkMode === "ultra-think") {
-          // Pass undefined if numAgents is 0 (auto mode)
-          const result = await runUltraThinkMode(
-            values.topic, 
-            numAgents === 0 ? undefined : numAgents, 
-            [], 
-            knowledgeContext
-          );
-          if (result) {
-            setUltraThinkResult(result);
-            // 保存到历史记录
-            const { saveThink } = useHistoryStore.getState();
-            saveThink("ultra-think", values.topic, result);
-          }
-        }
-      } finally {
-        // 只有在非交互模式或完成后才重置状态
-        if (!(thinkMode === "deep-think" && enableAskQuestions === "enable") || !interactiveState.isWaitingForAnswers) {
-          setIsThinking(false);
-          setGlobalThinking(false);
-          accurateTimerStop();
-        }
-      }
-    }
+    // 收集知识库资源
+    const knowledgeContext = collectKnowledgeContext();
+
+    // 建任务并排队，立即返回 —— 任务在后台跑，表单马上可用于下一个任务
+    startTask({
+      question: values.topic,
+      mode: thinkMode,
+      numAgents:
+        thinkMode === "ultra-think" && numAgents > 0 ? numAgents : undefined,
+      knowledgeContext: knowledgeContext || undefined,
+    });
   }
 
   // 处理用户回答并继续Deep Think
-  async function handleAnswersSubmit(answers: string) {
-    const {
-      setDeepThinkResult,
-      setIsThinking: setGlobalThinking,
-    } = useGlobalStore.getState();
-    
-    try {
-      // 重新启动计时器和思考状态
-      setIsThinking(true);
-      setGlobalThinking(true);
-      accurateTimerStart(); // 重新启动计时器！
-      
-      // 继续执行Deep Think
-      const result = await continueWithAnswers(answers);
-      if (result) {
-        setDeepThinkResult(result);
-        // 保存到历史记录
-        const { saveThink } = useHistoryStore.getState();
-        const { question } = useTaskStore.getState();
-        saveThink("deep-think", question, result);
-        // 成功后重置答案
-        setUserAnswers("");
-      }
-    } catch (error) {
-      console.error("继续思考时出错:", error);
-      toast.error("继续思考时出现错误，请重试");
-    } finally {
-      setIsThinking(false);
-      setGlobalThinking(false);
-      accurateTimerStop();
-    }
+  function handleAnswersSubmit(answers: string) {
+    if (!activeTask) return;
+    continueWithAnswers(activeTask.id, answers);
+    setUserAnswers("");
   }
 
   function createNewResearch() {
-    const { id, backup, reset } = useTaskStore.getState();
-    const { update } = useHistoryStore.getState();
-    const { resetThinkResults } = useGlobalStore.getState();
-    if (id) update(id, backup());
-    reset();
-    resetThinkResults();
-    resetInteractiveState(); // 重置交互状态
-    setUserAnswers(""); // 重置用户答案
-    setIsThinking(false); // 重置思考状态
-    accurateTimerStop(); // 停止计时器
+    const { setActive } = useThinkTaskStore.getState();
+    setActive(""); // 回到空白表单；已有任务保持在后台运行
+    setUserAnswers("");
     form.reset();
   }
 
@@ -257,9 +177,12 @@ function Topic() {
     }
   }
 
+  // 只在「切换任务」时同步表单，不能依赖整个 activeTask —— 它每次进度更新都是新引用，
+  // 否则运行中任务每秒都会把用户正在输入的内容覆盖掉
   useEffect(() => {
-    form.setValue("topic", taskStore.question);
-  }, [taskStore.question, form]);
+    const task = useThinkTaskStore.getState().get(activeTaskId);
+    form.setValue("topic", task ? task.question : "");
+  }, [activeTaskId, form]);
 
   return (
     <section className="p-4 border rounded-md mt-4 print:hidden">
@@ -279,7 +202,7 @@ function Topic() {
         </div>
       </div>
       {/* 问问题交互界面 - 在同一页面内显示 */}
-      {interactiveState.isWaitingForAnswers && interactiveState.questions ? (
+      {activeTask?.isWaitingForAnswers && activeTask.questions ? (
         <div className="space-y-4">
           {/* 显示生成的问题 */}
           <div className="p-4 border rounded-md bg-purple-50 dark:bg-purple-900/10">
@@ -290,7 +213,7 @@ function Topic() {
               {t("deepThink.questions.description")}
             </p>
             <div className="prose dark:prose-invert max-w-none text-sm bg-white dark:bg-gray-900 p-3 rounded">
-              <MagicDown value={interactiveState.questions} onChange={() => {}} hideTools />
+              <MagicDown value={activeTask.questions} onChange={() => {}} hideTools />
             </div>
           </div>
 
@@ -351,10 +274,7 @@ function Topic() {
             {/* Mode Selector */}
             <ModeSelector
               value={globalStore.thinkMode}
-              onChange={(mode) => {
-                globalStore.setThinkMode(mode);
-                globalStore.resetThinkResults();
-              }}
+              onChange={(mode) => globalStore.setThinkMode(mode)}
               className="mb-4"
             />
 
