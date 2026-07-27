@@ -185,6 +185,8 @@ const formSchema = z.object({
   modelStageSearch: z.string().optional(),
   enableAskQuestions: z.enum(["enable", "disable"]).optional(),
   enablePlanning: z.enum(["enable", "disable"]).optional(),
+  enableDiffAntiEmptyVerify: z.enum(["enable", "disable"]).optional(),
+  modelStageStructureAlign: z.string().optional(),
   maxConcurrentTasks: z.number().min(1).max(5),
 });
 
@@ -2191,6 +2193,7 @@ function Setting({ open, onClose }: SettingProps) {
                         { name: "modelStageImprovement", label: "改进阶段", tip: "自我改进阶段的模型。留空使用默认模型。" },
                         { name: "modelStageVerification", label: "验证阶段", tip: "验证阶段的模型。建议用便宜模型，比如 gpt-4o-mini。" },
                         { name: "modelStageCorrection", label: "修正阶段", tip: "修正错误阶段的模型。留空使用默认模型。" },
+                        { name: "modelStageStructureAlign", label: "结构对齐(diff)", tip: "截不到 Deep Dive 时，通读全文补标准标题的模型。建议用较强模型；留空使用默认模型。仅在启用「diff 防空审查」时会调用。" },
                       ].map((stage) => (
                         <FormField
                           key={stage.name}
@@ -2332,6 +2335,30 @@ function Setting({ open, onClose }: SettingProps) {
                           <FormLabel className="from-label">
                             <HelpTip tip="在开始深度思考前，AI 会先制定一个结构化的思考计划，包括问题分解、分析策略等，作为思考的路线图。">
                               启用计划阶段
+                            </HelpTip>
+                          </FormLabel>
+                          <FormControl>
+                            <Select {...field} onValueChange={field.onChange}>
+                              <SelectTrigger className="form-field">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="enable">启用</SelectItem>
+                                <SelectItem value="disable">禁用</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name="enableDiffAntiEmptyVerify"
+                      render={({ field }) => (
+                        <FormItem className="from-item">
+                          <FormLabel className="from-label">
+                            <HelpTip tip="验证前若截取不到 Deep Dive 段，先让模型通读全文、只补标准标题/归段（不重写内容），再截段给验证模型。避免「Analysis to Review 空白」空转，也避免默认把全文硬塞给弱验证模型。开启后每遇结构缺失会多一次 LLM 调用。">
+                              启用 diff 防空审查
                             </HelpTip>
                           </FormLabel>
                           <FormControl>

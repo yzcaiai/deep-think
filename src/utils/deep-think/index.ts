@@ -20,6 +20,8 @@ import {
   buildFinalSummaryPrompt,
   buildAskQuestionsPrompt,
   buildThinkingPlanPrompt,
+  structureAlignSystemPrompt,
+  buildStructureAlignPrompt,
 } from "./prompts";
 import { throwIfAborted } from "./registry";
 
@@ -48,6 +50,8 @@ export interface ModelStageConfig {
   synthesis?: string;
   /** Pre-Search: 搜索阶段生成搜索计划和评估结果的模型 */
   search?: string;
+  /** 结构对齐（diff 防空审查）阶段的模型 */
+  structureAlign?: string;
 }
 
 export interface DeepThinkOptions {
@@ -70,6 +74,11 @@ export interface DeepThinkOptions {
   userAnswers?: string;
   /** 是否启用计划阶段 - 在开始前制定思考计划 */
   enablePlanning?: boolean;
+  /**
+   * 启用 diff 防空审查：截取 Deep Dive 失败时，先用模型通读全文补标准标题/归段，
+   * 再截段给验证模型（不默认全文硬审）。
+   */
+  enableDiffAntiEmptyVerify?: boolean;
   /** 是否启用交互模式 - 在问问题阶段等待用户回答 */
   enableInteractiveMode?: boolean;
   onProgress?: (event: DeepThinkProgressEvent) => void;
@@ -240,19 +249,105 @@ export class DeepThinkEngine {
     return undefined;
   }
 
+  /**
+   * 从完整回复里按「标题行」截取段落。
+   *
+   * - 只认标题行形态（行首 / # 标题 / **加粗** / 可选编号），禁止正文子串误匹配
+   * - after=true 且找不到标记：返回 ""（由 verifySolution 决定是否走 diff 对齐）
+   * - after=false 且找不到标记：返回全文（用于抽 Summary 等）
+   */
   private extractDetailedSolution(
     solution: string,
     marker: string = extractDetailedSolutionMarker,
     after: boolean = true
   ): string {
-    const idx = solution.indexOf(marker);
-    if (idx === -1) {
-      return after ? "" : solution;
+    if (!solution) return "";
+
+    const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // 标题行：## Deep Dive / **2. Deep Dive** / Deep Dive:
+    const headingRe = new RegExp(
+      `(^|\\n)[ \\t]*(?:#{1,6}[ \\t]+)?(?:\\*{0,2})(?:\\d+\\.?\\s*)?${escaped}(?:\\*{0,2})[ \\t]*[:：]?[ \\t]*(?=\\n|$)`,
+      "i"
+    );
+    const m = headingRe.exec(solution);
+
+    if (!m) {
+      return after ? "" : solution.trim();
     }
+
+    const matchStart = m.index + (m[1] ? m[1].length : 0);
+    const matchEnd = m.index + m[0].length;
+
     if (after) {
-      return solution.substring(idx + marker.length).trim();
-    } else {
-      return solution.substring(0, idx).trim();
+      return solution.substring(matchEnd).trim();
+    }
+    return solution.substring(0, matchStart).trim();
+  }
+
+  /**
+   * 是否已有可审的 Deep Dive 段（标题行存在且正文够长）。
+   */
+  private hasReviewableDeepDive(solution: string): boolean {
+    const sliced = this.extractDetailedSolution(solution);
+    if (!sliced) return false;
+    const fullLen = solution.trim().length;
+    const minKeep = Math.min(80, Math.max(20, Math.floor(fullLen * 0.15)));
+    return sliced.length >= minKeep;
+  }
+
+  /**
+   * diff 防空审查：通读全文，只补标准标题/归段，不重写实质内容。
+   * 成功条件：输出里能再截出非空 Deep Dive。
+   */
+  private async alignSolutionStructure(
+    problemStatement: string,
+    solution: string
+  ): Promise<string | null> {
+    this.emit({
+      type: "progress",
+      data: { message: "结构对齐中（diff 防空审查）..." },
+    });
+    this.checkAborted();
+
+    try {
+      const alignModel = this.getModelForStage("structureAlign");
+      const model = await this.options.createModelProvider(alignModel);
+      const result = await generateText({
+        model,
+        system: structureAlignSystemPrompt,
+        prompt: buildStructureAlignPrompt(problemStatement, solution),
+        abortSignal: this.options.abortSignal,
+      });
+
+      let text = result.text?.trim() ?? "";
+      // 去掉模型偶尔加的 markdown 围栏
+      const fenced = text.match(/^```(?:markdown|md)?\s*([\s\S]*?)```$/i);
+      if (fenced) text = fenced[1].trim();
+
+      if (!text || !this.hasReviewableDeepDive(text)) {
+        this.emit({
+          type: "progress",
+          data: { message: "结构对齐未产出可用 Deep Dive，跳过对齐结果" },
+        });
+        return null;
+      }
+
+      this.emit({
+        type: "progress",
+        data: { message: "结构对齐完成，准备截段审查" },
+      });
+      return text;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") throw err;
+      if (err instanceof Error && (err.name === "AbortError" || /abort/i.test(err.message))) {
+        throw err;
+      }
+      console.warn("structure align failed:", err);
+      this.emit({
+        type: "progress",
+        data: { message: "结构对齐失败，将按现有正文尽量审查" },
+      });
+      return null;
     }
   }
 
@@ -325,7 +420,36 @@ export class DeepThinkEngine {
     problemStatement: string,
     solution: string
   ): Promise<{ bugReport: string; goodVerify: string }> {
-    const detailedSolution = this.extractDetailedSolution(solution);
+    let working = solution;
+    let detailedSolution = this.extractDetailedSolution(working);
+
+    // 截不到可用 Deep Dive：可选走 diff 结构对齐（通读全文补标签），再截段
+    // —— 不把全文硬塞给弱验证模型；对齐失败才有限回退全文，避免再审空
+    if (!this.hasReviewableDeepDive(working)) {
+      if (this.options.enableDiffAntiEmptyVerify) {
+        const aligned = await this.alignSolutionStructure(
+          problemStatement,
+          working
+        );
+        if (aligned) {
+          working = aligned;
+          detailedSolution = this.extractDetailedSolution(working);
+        }
+      }
+      // 仍空：最后手段才全文（总比 Analysis to Review 空白空转好）
+      if (!detailedSolution?.trim()) {
+        detailedSolution = working.trim();
+        this.emit({
+          type: "progress",
+          data: {
+            message: this.options.enableDiffAntiEmptyVerify
+              ? "对齐后仍无 Deep Dive，临时全文送审"
+              : "未启用 diff 防空审查且无 Deep Dive，临时全文送审",
+          },
+        });
+      }
+    }
+
     const verificationPrompt = buildVerificationPrompt(
       problemStatement,
       detailedSolution
@@ -347,8 +471,14 @@ export class DeepThinkEngine {
 
     const verificationOutput = verificationResult.text;
 
-    // Check if verification is good
-    const checkPrompt = `Response in "yes" or "no". Is the following statement saying the solution is correct, or does not contain critical error or a major justification gap?\n\n${verificationOutput}`;
+    // yes/no：优先行首；避免正文偶然出现 yes 误通过
+    const checkPrompt = `Reply with exactly one word: yes or no.
+Is the following review saying the work is acceptable overall (no critical flaw and no major justification gap)?
+- yes = sound enough (minor issues OK)
+- no = critical flaw, major gap, incomplete, OR review says content is missing/empty
+
+Review:
+${verificationOutput}`;
 
     const checkResult = await generateText({
       model,
@@ -356,18 +486,30 @@ export class DeepThinkEngine {
       abortSignal: this.options.abortSignal,
     });
 
-    const goodVerify = checkResult.text;
-    let bugReport = "";
+    const raw = checkResult.text.trim();
+    const head = raw.split(/\s+/)[0]?.replace(/[^a-zA-Z一-鿿]/g, "") ?? "";
+    const passed =
+      /^(yes|y|是|通过|正确)$/i.test(head) ||
+      (/^yes\b/i.test(raw) && !/^no\b/i.test(raw));
 
-    if (!goodVerify.toLowerCase().includes("yes")) {
-      bugReport = this.extractDetailedSolution(
+    let bugReport = "";
+    if (!passed) {
+      // 优先 Summary（Detailed Review 标题之前）；否则整段审查给修正阶段
+      const summaryOnly = this.extractDetailedSolution(
         verificationOutput,
         "Detailed Review",
         false
       );
+      bugReport =
+        summaryOnly &&
+        summaryOnly.length >= 40 &&
+        summaryOnly.length < verificationOutput.length
+          ? summaryOnly
+          : verificationOutput;
     }
 
-    return { bugReport, goodVerify };
+    // 主循环用 includes("yes")；通过时规范成 "yes"
+    return { bugReport, goodVerify: passed ? "yes" : raw || "no" };
   }
 
   private   async initialExploration(

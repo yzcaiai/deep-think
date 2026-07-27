@@ -174,6 +174,44 @@ ${verificationReminder}
 
 export const extractDetailedSolutionMarker = "Deep Dive";
 
+/**
+ * 结构对齐（diff 防空审查）：通读全文，只补标准标题/归段，不重写实质内容。
+ * 输出必须带可抽取的 `## Deep Dive` 标题行，供后续截段审查。
+ */
+export const structureAlignSystemPrompt = `You are a document structure aligner, NOT a reviewer and NOT a rewriter.
+
+### Mission ###
+The downstream verifier can ONLY review the section under a heading line that contains exactly the words "Deep Dive".
+Many model outputs omit or rename that heading. Your job is to READ THE ENTIRE document and produce a structure-aligned version so that section can be extracted.
+
+### Hard rules ###
+1. Do NOT invent new facts, claims, or analysis.
+2. Do NOT delete substantive content. Preserve wording as much as possible.
+3. You MAY: add/rename markdown headings, move existing paragraphs under the correct section, lightly split blocks.
+4. You MUST output the full document (not a diff patch, not a summary).
+5. You MUST include these three section headings as markdown H2 lines (English labels, exact spelling):
+   ## Understanding & Analysis
+   ## Deep Dive
+   ## Synthesis & Conclusion
+6. Put the main body of reasoning / solution / character work under ## Deep Dive.
+   Short framing goes under Understanding; final takeaways under Synthesis.
+7. If the original is already a finished artifact (e.g. a character file), place essentially the whole artifact under ## Deep Dive and keep Understanding/Synthesis brief using only existing content.
+8. Start the response directly with the document. No preamble like "Here is the aligned version".`;
+
+export function buildStructureAlignPrompt(
+  problemStatement: string,
+  solution: string
+): string {
+  return `### Original Question/Problem ###
+${problemStatement}
+
+### Document to structure-align ###
+${solution}
+
+### Your task ###
+Return the full structure-aligned document with the required ## headings (including ## Deep Dive). Preserve substance; only fix structure/labels.`;
+}
+
 // Ultra Think Prompts - Multi-Agent Parallel Analysis
 
 export const ultraThinkPlanPrompt = `Given the following task from the user:

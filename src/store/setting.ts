@@ -94,9 +94,16 @@ export interface SettingStore {
   modelStageAgentThinking: string;
   modelStageSynthesis: string;
   modelStageSearch: string;
+  /** 结构对齐（diff 防空审查）阶段模型，仅 enableModelStages 时生效 */
+  modelStageStructureAlign: string;
   // DeepThink 询问和计划阶段
   enableAskQuestions: "enable" | "disable";
   enablePlanning: "enable" | "disable";
+  /**
+   * 启用 diff 防空审查：截取 Deep Dive 失败时，先用模型通读全文补标准标题/归段，
+   * 再截段给验证模型，避免「Analysis to Review 空白」空转，也不默认全文硬审。
+   */
+  enableDiffAntiEmptyVerify: "enable" | "disable";
   /** 同时运行的思考任务上限，超出的任务排队等待 */
   maxConcurrentTasks: number;
 }
@@ -199,8 +206,10 @@ export const defaultValues: SettingStore = {
   modelStageAgentThinking: "",
   modelStageSynthesis: "",
   modelStageSearch: "",
+  modelStageStructureAlign: "",
   enableAskQuestions: "disable",
   enablePlanning: "disable",
+  enableDiffAntiEmptyVerify: "enable",
   maxConcurrentTasks: 3,
 };
 

@@ -204,8 +204,10 @@ function useDeepThinkEngine() {
       modelStageCorrection,
       modelStageSummary,
       modelStageSearch,
+      modelStageStructureAlign,
       enableAskQuestions,
       enablePlanning,
+      enableDiffAntiEmptyVerify,
     } = useSettingStore.getState();
 
     const enableWebSearch = enableSearch === "1" &&
@@ -220,6 +222,7 @@ function useDeepThinkEngine() {
       correction: modelStageCorrection || undefined,
       summary: modelStageSummary || undefined,
       search: modelStageSearch || undefined,
+      structureAlign: modelStageStructureAlign || undefined,
     } : undefined;
 
     // 兜底：引擎启动前搜索。结果注入 knowledgeContext，让 DT 模型在 prompt 里直接引用
@@ -252,6 +255,7 @@ function useDeepThinkEngine() {
       searchFn,
       enableAskQuestions: enableAskQuestions === "enable",
       enablePlanning: enablePlanning === "enable",
+      enableDiffAntiEmptyVerify: enableDiffAntiEmptyVerify !== "disable",
       createModelProvider,
       thinkingModel: model,
       modelStages,
@@ -299,8 +303,10 @@ function useDeepThinkEngine() {
       modelStageAgentThinking,
       modelStageSynthesis,
       modelStageSearch,
+      modelStageStructureAlign,
       enableAskQuestions,
       enablePlanning,
+      enableDiffAntiEmptyVerify,
     } = useSettingStore.getState();
 
     const enableWebSearch = enableSearch === "1" &&
@@ -319,6 +325,7 @@ function useDeepThinkEngine() {
       agentThinking: modelStageAgentThinking || undefined,
       synthesis: modelStageSynthesis || undefined,
       search: modelStageSearch || undefined,
+      structureAlign: modelStageStructureAlign || undefined,
     } : undefined;
 
     if (numAgents) {
@@ -366,6 +373,7 @@ function useDeepThinkEngine() {
       searchFn,
       enableAskQuestions: enableAskQuestions === "enable",
       enablePlanning: enablePlanning === "enable",
+      enableDiffAntiEmptyVerify: enableDiffAntiEmptyVerify !== "disable",
       numAgents,
       createModelProvider,
       thinkingModel: model,
@@ -414,7 +422,9 @@ function useDeepThinkEngine() {
       modelStageCorrection,
       modelStageSummary,
       modelStageSearch,
+      modelStageStructureAlign,
       enablePlanning,
+      enableDiffAntiEmptyVerify,
     } = useSettingStore.getState();
 
     const enableWebSearch = enableSearch === "1" &&
@@ -429,6 +439,7 @@ function useDeepThinkEngine() {
       correction: modelStageCorrection || undefined,
       summary: modelStageSummary || undefined,
       search: modelStageSearch || undefined,
+      structureAlign: modelStageStructureAlign || undefined,
     } : undefined;
 
     const options: DeepThinkOptions = {
@@ -443,6 +454,7 @@ function useDeepThinkEngine() {
       enableAskQuestions: true,
       enableInteractiveMode: true,
       enablePlanning: enablePlanning === "enable",
+      enableDiffAntiEmptyVerify: enableDiffAntiEmptyVerify !== "disable",
       createModelProvider,
       thinkingModel: model,
       modelStages,
