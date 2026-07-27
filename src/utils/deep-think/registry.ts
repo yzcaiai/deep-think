@@ -9,6 +9,13 @@ import Plimit from "p-limit";
 
 const controllers = new Map<string, AbortController>();
 
+/**
+ * 每个 taskId 的运行代数。cancel / resume / 重新 schedule 时递增，
+ * 用来作废仍在 flight 的旧回调——否则旧 run 的 failTask/finishTask
+ * 会把已经开始的新一轮又打回 cancelled/failed（表现为「一点重试就失败」）。
+ */
+const runGenerations = new Map<string, number>();
+
 const DEFAULT_CONCURRENCY = 3;
 let limit = Plimit(DEFAULT_CONCURRENCY);
 let currentConcurrency = DEFAULT_CONCURRENCY;
@@ -26,6 +33,22 @@ export function setConcurrency(n: number) {
 
 export function getConcurrency(): number {
   return currentConcurrency;
+}
+
+/** 开启新一轮运行，返回本轮 generation。旧轮的回调应在写状态前用 isCurrentGeneration 自检。 */
+export function beginRun(taskId: string): number {
+  const next = (runGenerations.get(taskId) ?? 0) + 1;
+  runGenerations.set(taskId, next);
+  return next;
+}
+
+export function isCurrentGeneration(taskId: string, generation: number): boolean {
+  return runGenerations.get(taskId) === generation;
+}
+
+/** 作废当前 in-flight 回调（不登记新 run）。cancel 时用。 */
+export function invalidateRun(taskId: string): void {
+  runGenerations.set(taskId, (runGenerations.get(taskId) ?? 0) + 1);
 }
 
 /**
@@ -56,6 +79,13 @@ export function cancel(taskId: string) {
 
 export function isActive(taskId: string): boolean {
   return controllers.has(taskId);
+}
+
+/** 任务彻底移除时清理 generation，避免 Map 无限增长 */
+export function clearRun(taskId: string) {
+  controllers.get(taskId)?.abort();
+  controllers.delete(taskId);
+  runGenerations.delete(taskId);
 }
 
 /** 判断错误是否由 abort 引起（用于把取消和真实失败区分开） */

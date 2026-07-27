@@ -13,7 +13,15 @@ import {
   type DeepThinkOptions,
 } from "@/utils/deep-think";
 import { runPreSearchPhase } from "@/utils/deep-think/preSearch";
-import { schedule, cancel, isAbortError } from "@/utils/deep-think/registry";
+import {
+  schedule,
+  cancel,
+  isAbortError,
+  beginRun,
+  isCurrentGeneration,
+  invalidateRun,
+  clearRun,
+} from "@/utils/deep-think/registry";
 import { parseError } from "@/utils/error";
 import { isNetworkingModel } from "@/utils/model";
 
@@ -47,13 +55,16 @@ function useDeepThinkEngine() {
     const { update } = useThinkTaskStore.getState();
 
     switch (event.type) {
-      case "init":
+      case "init": {
+        // 续跑时不要把 iteration 清零，否则 UI 会闪一下「第 0 轮」
+        const existing = useThinkTaskStore.getState().get(taskId);
         update(taskId, {
           statusText: t("deepThink.status.initializing"),
-          currentIteration: 0,
+          currentIteration: existing?.snapshot?.completedIterations ?? 0,
           currentPhase: "initializing",
         });
         break;
+      }
       case "asking":
         update(taskId, {
           currentPhase: "asking",
@@ -178,7 +189,8 @@ function useDeepThinkEngine() {
     otherPrompts: string[] = [],
     knowledgeContext?: string,
     abortSignal?: AbortSignal,
-    resumeFrom?: ThinkTaskSnapshot
+    resumeFrom?: ThinkTaskSnapshot,
+    generation?: number
   ): Promise<DeepThinkResult> {
     const { model } = getModel();
     const {
@@ -247,7 +259,10 @@ function useDeepThinkEngine() {
       resumeFrom,
       // 续跑交互式任务时带回用户当初的回答，避免重新提问
       userAnswers: resumeFrom?.userAnswers,
-      onProgress: (event) => handleProgress(taskId, event),
+      onProgress: (event) => {
+        if (generation !== undefined && !isCurrentGeneration(taskId, generation)) return;
+        handleProgress(taskId, event);
+      },
     });
 
     if (result && preSearchSources.length > 0) {
@@ -264,7 +279,8 @@ function useDeepThinkEngine() {
     otherPrompts: string[] = [],
     knowledgeContext?: string,
     abortSignal?: AbortSignal,
-    resumeFrom?: ThinkTaskSnapshot
+    resumeFrom?: ThinkTaskSnapshot,
+    generation?: number
   ): Promise<UltraThinkResult> {
     const { model } = getModel();
     const { update, updateAgentResult } = useThinkTaskStore.getState();
@@ -357,8 +373,12 @@ function useDeepThinkEngine() {
       abortSignal,
       resumeFrom,
       userAnswers: resumeFrom?.userAnswers,
-      onProgress: (event) => handleProgress(taskId, event),
+      onProgress: (event) => {
+        if (generation !== undefined && !isCurrentGeneration(taskId, generation)) return;
+        handleProgress(taskId, event);
+      },
       onAgentUpdate: (agentId: string, agentUpdate: Partial<AgentResult>) => {
+        if (generation !== undefined && !isCurrentGeneration(taskId, generation)) return;
         updateAgentResult(taskId, agentId, agentUpdate);
       },
     });
@@ -379,7 +399,8 @@ function useDeepThinkEngine() {
     problemStatement: string,
     otherPrompts: string[] = [],
     knowledgeContext?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    generation?: number
   ): Promise<{ questions?: string }> {
     const { model } = getModel();
     const {
@@ -426,11 +447,17 @@ function useDeepThinkEngine() {
       thinkingModel: model,
       modelStages,
       abortSignal,
-      onProgress: (event) => handleProgress(taskId, event),
+      onProgress: (event) => {
+        if (generation !== undefined && !isCurrentGeneration(taskId, generation)) return;
+        handleProgress(taskId, event);
+      },
     };
 
     const engine = new DeepThinkEngine(options);
     const questions = await engine.askQuestions(problemStatement, true);
+    if (generation !== undefined && !isCurrentGeneration(taskId, generation)) {
+      return { questions };
+    }
     interactiveSessions.set(taskId, { engine, options });
 
     return { questions };
@@ -462,8 +489,10 @@ function useDeepThinkEngine() {
       },
     });
 
+    // 交互阶段可能已经挂过一个 schedule；先作废旧 generation 再开新一轮
+    const generation = beginRun(taskId);
     void schedule(taskId, async (signal) => {
-      if (signal.aborted) return;
+      if (signal.aborted || !isCurrentGeneration(taskId, generation)) return;
       update(taskId, { status: "running", startedAt: Date.now() });
       try {
         let knowledgeContext = session.options.knowledgeContext;
@@ -489,13 +518,18 @@ function useDeepThinkEngine() {
           }
         }
 
+        if (!isCurrentGeneration(taskId, generation)) return;
+
         const result = await runDeepThink({
           ...session.options,
           knowledgeContext,
           userAnswers,
           enableInteractiveMode: false,
           abortSignal: signal,
-          onProgress: (event) => handleProgress(taskId, event),
+          onProgress: (event) => {
+            if (!isCurrentGeneration(taskId, generation)) return;
+            handleProgress(taskId, event);
+          },
         });
 
         if (result && preSearchSources.length > 0) {
@@ -503,22 +537,27 @@ function useDeepThinkEngine() {
           result.knowledgeEnhanced = true;
         }
 
-        finishTask(taskId, "deep-think", problem, result);
+        finishTask(taskId, "deep-think", problem, result, generation);
       } catch (err) {
-        failTask(taskId, err);
+        failTask(taskId, err, generation);
       } finally {
-        interactiveSessions.delete(taskId);
+        // 只有本轮还是 current 时才清 session，避免误删后续 resume 的会话
+        if (isCurrentGeneration(taskId, generation)) {
+          interactiveSessions.delete(taskId);
+        }
       }
     });
   }
 
-  /** 写入结果、存历史、标记完成 */
+  /** 写入结果、存历史、标记完成。generation 不匹配时说明任务已被取消/续跑，忽略。 */
   function finishTask(
     taskId: string,
     mode: ThinkMode,
     question: string,
-    result: DeepThinkResult | UltraThinkResult
+    result: DeepThinkResult | UltraThinkResult,
+    generation: number
   ) {
+    if (!isCurrentGeneration(taskId, generation)) return;
     const { update } = useThinkTaskStore.getState();
     const { saveThink } = useHistoryStore.getState();
     const historyId = saveThink(mode, question, result);
@@ -533,8 +572,13 @@ function useDeepThinkEngine() {
     });
   }
 
-  /** 区分「用户取消」和「真实失败」 */
-  function failTask(taskId: string, err: unknown) {
+  /**
+   * 区分「用户取消」和「真实失败」。
+   * generation 不匹配时说明用户已经点了重试/取消后又开了新一轮——
+   * 旧回调绝不能把新一轮打回 cancelled/failed（那就是「一点重试就失败」）。
+   */
+  function failTask(taskId: string, err: unknown, generation: number) {
+    if (!isCurrentGeneration(taskId, generation)) return;
     const { update } = useThinkTaskStore.getState();
     if (isAbortError(err)) {
       update(taskId, {
@@ -579,9 +623,12 @@ function useDeepThinkEngine() {
       enableAskQuestions === "enable" &&
       !snapshot?.questions;
 
+    // 开新一轮：作废同 taskId 上仍在 flight 的旧回调（取消后立刻点重试就是这个场景）
+    const generation = beginRun(taskId);
+
     void schedule(taskId, async (signal) => {
-      // 排队期间被取消：直接落终态，不要先闪一下 running
-      if (signal.aborted) return;
+      // 排队期间被取消 / 已被更新的 generation 取代：直接退出，不要闪 running、不要 failTask
+      if (signal.aborted || !isCurrentGeneration(taskId, generation)) return;
       update(taskId, {
         status: "running",
         startedAt: Date.now(),
@@ -597,7 +644,8 @@ function useDeepThinkEngine() {
             task.question,
             [],
             task.knowledgeContext,
-            signal
+            signal,
+            generation
           );
           return;
         }
@@ -609,9 +657,10 @@ function useDeepThinkEngine() {
             [],
             task.knowledgeContext,
             signal,
-            snapshot
+            snapshot,
+            generation
           );
-          finishTask(taskId, "deep-think", task.question, result);
+          finishTask(taskId, "deep-think", task.question, result, generation);
         } else {
           const result = await runUltraThinkMode(
             taskId,
@@ -620,12 +669,13 @@ function useDeepThinkEngine() {
             [],
             task.knowledgeContext,
             signal,
-            snapshot
+            snapshot,
+            generation
           );
-          finishTask(taskId, "ultra-think", task.question, result);
+          finishTask(taskId, "ultra-think", task.question, result, generation);
         }
       } catch (err) {
-        failTask(taskId, err);
+        failTask(taskId, err, generation);
       }
     });
   }
@@ -634,28 +684,42 @@ function useDeepThinkEngine() {
    * 断点续跑：从失败/取消处继续。
    * 有快照则跳过已完成阶段（DT 从中断轮次接着跑，UT 只重跑未完成的 agent）；
    * 无快照则等价于从头重试。
+   *
+   * 也可对 running/queued 任务调用——会先 abort 当前一轮再开新一轮
+   * （generation 保护保证旧回调不会把新一轮打回失败）。
    */
   function resumeTask(taskId: string) {
     const task = useThinkTaskStore.getState().get(taskId);
     if (!task) return;
-    if (task.status === "running" || task.status === "queued") return;
+
+    // 若仍在跑/排队，先 abort 旧 controller（generation 会在 dispatchRun 里递增）
+    if (task.status === "running" || task.status === "queued") {
+      cancel(taskId);
+    }
 
     useThinkTaskStore.getState().update(taskId, {
       status: "queued",
       statusText: "",
       error: undefined,
+      finishedAt: undefined,
     });
     dispatchRun(taskId);
   }
 
-  /** 取消任务：中断在途请求，并清理交互会话 */
+  /** 取消任务：中断在途请求，作废 generation，清理交互会话 */
   function cancelTask(taskId: string) {
     cancel(taskId);
+    invalidateRun(taskId); // 作废 in-flight 的 finish/fail，避免晚到的 abort 再写一次状态
     interactiveSessions.delete(taskId);
     const { get, update } = useThinkTaskStore.getState();
     const task = get(taskId);
-    // 排队中/等待回答的任务不在 schedule 的 try 内，不会走到 catch，这里直接落终态
-    if (task && (task.status === "queued" || task.status === "waiting")) {
+    // 排队中/等待回答/运行中：直接落终态（运行中的 catch 也会因 generation 不匹配而忽略）
+    if (
+      task &&
+      (task.status === "queued" ||
+        task.status === "waiting" ||
+        task.status === "running")
+    ) {
       update(taskId, {
         status: "cancelled",
         finishedAt: Date.now(),
@@ -667,7 +731,7 @@ function useDeepThinkEngine() {
 
   /** 删除任务：先取消，再从列表移除 */
   function removeTask(taskId: string) {
-    cancel(taskId);
+    clearRun(taskId);
     interactiveSessions.delete(taskId);
     useThinkTaskStore.getState().remove(taskId);
   }
